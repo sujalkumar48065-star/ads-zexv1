@@ -5627,7 +5627,14 @@ def _start_keep_alive():
 
 def main():
     _start_keep_alive()
-    app = Application.builder().token(BOT_TOKEN).build()
+
+    async def _post_init(application):
+        application.create_task(check_resume_tasks(application))
+
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .post_init(_post_init)
+           .build())
 
     auto_clear_cache()
 
@@ -5658,11 +5665,6 @@ def main():
     app.add_handler(MessageHandler(filters.Sticker.ALL, group_text_handler))
 
     logger.info("Bot started! Press Ctrl+C to stop.")
-
-    # Run resume check after polling starts
-    loop = asyncio.get_event_loop()
-    loop.create_task(check_resume_tasks(app))
-
     app.run_polling()
 
 if __name__ == "__main__":
