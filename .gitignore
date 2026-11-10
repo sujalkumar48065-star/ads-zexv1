@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+user_data/
+logs/
+*.session
+gclinks.txt
+api_config.json
+.env
