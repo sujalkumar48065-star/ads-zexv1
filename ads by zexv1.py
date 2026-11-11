@@ -1156,7 +1156,7 @@ class UserData:
                         "mode":"send","add_gap":20,"add_running":False,"pending":[],
                         "add_added":0,"add_failed":0,"member_mode":"all","girl_keywords":"",
                         "added_uids":[],"source_used":"","found_total":0,"last_error":"",
-                        "per_acc":{},"add_skipped":0},
+                        "per_acc":{},"add_skipped":0,"mutual_boost":True},
             "gm": {"group_id":0,"group_title":"","notify":True,"join_reply":True,
                    "join_reply_text":"{username} Your request is received to join {grouptitle} received sweetie and it will accept soon.",
                    "welcome_enabled":False,"welcome_text":"Welcome {name} to {title}!",
@@ -1538,7 +1538,8 @@ def scraper_menu(ud):
         [InlineKeyboardButton("⏱️  Batch Gap: %ds" % s.get("gap", 3), callback_data="scraper_set_gap")],
         [InlineKeyboardButton("👤  User Gap: %s" % ug_label, callback_data="scraper_user_gap"),
          InlineKeyboardButton("📅  Daily Limit: %s" % dl_label, callback_data="scraper_daily_limit")],
-        [InlineKeyboardButton("➕  Add Gap: %ds" % s.get("add_gap", 20), callback_data="scraper_add_gap")],
+        [InlineKeyboardButton("➕  Add Gap: %ds" % s.get("add_gap", 20), callback_data="scraper_add_gap"),
+         InlineKeyboardButton("🤝  Boost: %s" % ("ON" if s.get("mutual_boost", True) else "OFF"), callback_data="scraper_mutual_toggle")],
         [InlineKeyboardButton(add_label, callback_data="scrap_add_yes")],
         [InlineKeyboardButton("🔙  Back", callback_data="scraper_hub")],
     ])
@@ -2190,7 +2191,7 @@ async def scraper_task(user_id, phone, bot):
     ud = get_user_data(user_id); s = ud.data["scraper"]
     for k, v in (("member_mode", "all"), ("girl_keywords", ""), ("added_uids", []),
                  ("source_used", ""), ("found_total", 0), ("last_error", ""),
-                 ("per_acc", {}), ("add_skipped", 0)):
+                 ("per_acc", {}), ("add_skipped", 0), ("mutual_boost", True)):
         s.setdefault(k, v)
     client = await get_client(phone, ud)
     if not client:
@@ -2494,6 +2495,29 @@ async def scrap_add_task(user_id, phones, bot):
             s["destination_is_basic"] = all(isinstance(d, Chat) for _, _, d in pool)
         except Exception:
             s["destination_is_basic"] = False
+
+        boosted = 0
+        if s.get("mutual_boost", True) and s.get("target") and s.get("target") != s.get("delivery"):
+            for _ph, _c, _d in pool:
+                try:
+                    _ent = await resolve_entity(_c, s["target"])
+                    if _ent is not None:
+                        try:
+                            await _c(JoinChannelRequest(_ent))
+                        except UserAlreadyParticipantError:
+                            pass
+                        except Exception:
+                            pass
+                        boosted += 1
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+            if boosted:
+                await notify_progress(bot, user_id,
+                    "🤝 <b>MUTUAL CONTACT BOOST</b>\n"
+                    "%d/%d accounts target group me join kar diye — "
+                    "isse 'mutual contact only' error bahut kam hoga."
+                    % (boosted, len(pool)))
 
         accs_label = ", ".join("…" + (p[-4:] if len(p) >= 4 else p) for p, _, _ in pool)
         dest_title = getattr(pool[0][2], "title", None) or s["delivery"]
@@ -4735,6 +4759,12 @@ async def button_handler(update, context):
                 "  (the active account must be admin there)\n"
                 "  fetches members → asks confirm → adds",
                 parse_mode=ParseMode.HTML, reply_markup=scraper_menu(ud))
+        elif data == "scraper_mutual_toggle":
+            s = ud.data["scraper"]
+            s["mutual_boost"] = not s.get("mutual_boost", True)
+            ud.save()
+            log_activity(user_id, f"Mutual boost -> {s['mutual_boost']}")
+            await query.edit_message_reply_markup(reply_markup=scraper_menu(ud))
         elif data == "scraper_add_gap":
             s = ud.data["scraper"]
             choices = [10, 15, 20, 25, 30, 45, 60, 90, 120, 180]
@@ -6230,6 +6260,12 @@ def main():
     app.add_handler(MessageHandler(filters.Sticker.ALL, group_text_handler))
 
     logger.info("Bot started! Press Ctrl+C to stop.")
+    # Python 3.14 removed the implicit main-thread event loop; PTB 21.x still
+    # calls asyncio.get_event_loop() internally, so install a loop first.
+    try:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    except Exception:
+        pass
     app.run_polling()
 
 if __name__ == "__main__":
