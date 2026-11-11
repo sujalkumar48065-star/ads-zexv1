@@ -15,7 +15,7 @@ for pkg_name, import_name in PACKAGE_MAP.items():
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name, "-q"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-import asyncio, json, logging, re, random, os, html, time, io, zipfile
+import asyncio, json, logging, re, random, os, html, time, io, zipfile, hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Set
@@ -42,6 +42,12 @@ from telethon.tl.types import (ChatInviteAlready, InputPeerChannel, ChannelParti
     InputPeerUser, Channel, Chat)
 from telethon import functions
 from telethon.sessions import StringSession
+try:
+    from tg_storage import STORAGE
+except ModuleNotFoundError:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from tg_storage import STORAGE
 
 class ColoredFormatter(logging.Formatter):
     COLORS = {
@@ -109,6 +115,15 @@ def load_api_config():
                 BOT_TOKEN = cfg.get("bot_token", BOT_TOKEN)
                 OWNER_ID = cfg.get("owner_id", OWNER_ID)
         except: pass
+    try:
+        cfg = STORAGE.get_json("config:api")
+        if isinstance(cfg, dict) and cfg:
+            API_ID = int(cfg.get("api_id", API_ID))
+            API_HASH = cfg.get("api_hash", API_HASH)
+            BOT_TOKEN = cfg.get("bot_token", BOT_TOKEN)
+            OWNER_ID = int(cfg.get("owner_id", OWNER_ID))
+    except Exception:
+        pass
 
 load_api_config()
 
@@ -927,13 +942,19 @@ def h_delay(base=None):
     return max(0.5, base * (0.7 + random.random() * 0.6))
 
 def log_activity(user_id, action):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = "[%s] %s" % (ts, action)
     try:
+        DATA_DIR.mkdir(exist_ok=True)
         log_file = DATA_DIR / f"{user_id}_activity.log"
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {action}\n")
+            f.write(line + "\n")
     except Exception as e:
-        logger.error(f"Failed to log activity: {e}")
+        logger.error(f"Failed to write local log cache: {e}")
+    try:
+        STORAGE.append_log("logs:%d" % user_id, line)
+    except Exception as e:
+        logger.error(f"Failed to buffer activity log: {e}")
 
 async def send_alert(bot, user_id, message):
     try:
@@ -1172,11 +1193,19 @@ class UserData:
         self.load()
 
     def load(self):
+        key = "user:%d:data" % self.user_id
+        st = STORAGE.get_json(key)
+        if isinstance(st, dict) and st:
+            self._deep_merge(self.data, st)
+            return
         if self.file_path.exists():
             try:
                 with open(self.file_path) as f:
                     loaded = json.load(f)
                     self._deep_merge(self.data, loaded)
+                # migrate legacy local data into Telegram storage
+                STORAGE.put_json(key, self.data)
+                logger.info("Migrated local data for %s to Telegram storage", self.user_id)
             except Exception as e:
                 logger.error(f"Failed to load user data {self.user_id}: {e}")
 
@@ -1194,9 +1223,12 @@ class UserData:
                 json.dump(self.data, f, indent=2)
             tmp.rename(self.file_path)
         except Exception as e:
-            logger.error(f"Failed to save data: {e}")
+            logger.error(f"Failed to save local cache: {e}")
             if tmp.exists():
-                tmp.unlink()
+                try: tmp.unlink()
+                except Exception: pass
+        # Permanent storage is Telegram; local file above is only a cache.
+        STORAGE.put_json("user:%d:data" % self.user_id, self.data)
 
 USER_DATA_CACHE: Dict[int, UserData] = {}
 
@@ -1383,6 +1415,10 @@ def menu_logs_text(ud, user_id):
         diag.append("Last error: %s" % str(r["last_error"])[:140])
     for ph, reason in list(CLIENT_ERRORS.items())[:3]:
         diag.append("acct …%s: %s" % (ph[-4:], str(reason)[:90]))
+    _st = STORAGE.status()
+    diag.append("storage: %s keys=%d pending=%d ns=%s" % (
+        "ONLINE" if _st.get("available") else "OFFLINE",
+        _st.get("keys", 0), _st.get("pending", 0), _st.get("namespace")))
     body = "\n".join("<code>%s</code>" % html.escape(x) for x in lines) if lines else "<i>No activity yet.</i>"
     return ("📈  <b>LIVE LOGS</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
@@ -1732,7 +1768,8 @@ async def show_help(update, context):
             "  /stats   →  Quick stats\n"
             "  /cleanup →  Remove dead accounts\n"
             "  /backup  →  Data zip download (accounts + groups)\n"
-            "  /restore →  Backup zip reply karke import\n\n"
+            "  /restore →  Backup zip reply karke import\n"
+            "  /storage →  Telegram storage status / reconnect\n\n"
             "📌  <b>Features</b>\n"
             "  👤  <b>Accounts</b>    —  Add & manage your Telegram accounts\n"
             "  🔄  <b>Rejoin</b>      —  Auto join/leave groups in cycles\n"
@@ -5321,6 +5358,7 @@ async def message_handler(update, context):
                 config = {"api_id": api_id, "api_hash": api_hash, "bot_token": bot_token, "owner_id": owner_id}
                 with open("api_config.json", "w") as f:
                     json.dump(config, f)
+                STORAGE.put_json("config:api", config)
                 API_ID = api_id; API_HASH = api_hash; BOT_TOKEN = bot_token; OWNER_ID = owner_id
                 context.user_data['_state'] = None
                 await update.message.reply_text("✅  API credentials updated!  Restart recommended.",
@@ -5877,21 +5915,71 @@ async def message_handler(update, context):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
+async def storage_cmd(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    arg = (context.args[0] if getattr(context, "args", None) else "").lower()
+    if arg in ("reconnect", "retry", "init"):
+        await update.message.reply_text("🔄 Telegram storage reconnect try kar raha hoon...")
+        ok = await STORAGE.initialize(context.bot)
+        await update.message.reply_text("✅ Connected" if ok else
+            "❌ Failed: %s" % html.escape(STORAGE.last_error or "unknown"))
+        return
+    st = STORAGE.status()
+    age = "—"
+    if st.get("last_sync"):
+        age = "%ds ago" % max(0, int(time.time() - st["last_sync"]))
+    flags = "🟢 ONLINE" if st.get("available") else ("🟡 DISABLED" if not st.get("enabled") else "🔴 OFFLINE")
+    txt = (
+        "🗄️  <b>TELEGRAM STORAGE</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Status:    {flags}\n"
+        f"Channel:   <code>{st.get('channel')}</code>\n"
+        f"Namespace: <code>{html.escape(str(st.get('namespace')))}</code>\n"
+        f"Keys:      {st.get('keys')}   Version: {st.get('version')}\n"
+        f"Pending:   {st.get('pending')}   Chunk: {st.get('chunk_size')} bytes\n"
+        f"Last sync: {age}\n"
+        f"Stats:     w{st['stats'].get('writes',0)} r{st['stats'].get('reads',0)} "
+        f"d{st['stats'].get('deletes',0)} err{st['stats'].get('errors',0)}\n"
+        + (f"\n⚠️ <code>{html.escape(str(st.get('last_error'))[:180])}</code>" if st.get('last_error') else "")
+        + "\n\n<b>Setup:</b> bot ko channel me admin banao, phir <code>/storage reconnect</code>."
+    )
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
 async def backup_cmd(update, context):
     if not is_authorized(update.effective_user.id):
         return
     uid = update.effective_user.id
     try:
+        entries = {}
+        try:
+            entries.update(await STORAGE.export_keys("user:%d:" % uid))
+        except Exception as e:
+            logger.warning("storage backup user keys: %s", e)
+        try:
+            entries.update(await STORAGE.export_keys("logs:%d" % uid))
+        except Exception as e:
+            logger.warning("storage backup log keys: %s", e)
+
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            for f in DATA_DIR.glob("%s_*" % uid):
-                if f.is_file():
-                    z.write(f, arcname=f.name)
+            for key, raw in entries.items():
+                if key == "user:%d:data" % uid:
+                    name = "%d_data.json" % uid
+                elif key == "logs:%d" % uid:
+                    name = "%d_activity.log" % uid
+                else:
+                    name = key.replace(":", "_") + ".bin"
+                z.writestr(name, raw)
+            if not entries and DATA_DIR.exists():
+                for f in DATA_DIR.glob("%s_*" % uid):
+                    if f.is_file():
+                        z.write(f, arcname=f.name)
         buf.seek(0)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
         await update.message.reply_document(document=buf,
             filename="ads_backup_%s_%s.zip" % (uid, stamp),
-            caption="🗄️ Backup — Render restart ke baad /restore se wapas import karo.")
+            caption="🗄️ Backup — Telegram storage se export. Restart ke baad /restore se import karo.")
         log_activity(uid, "Created backup")
     except Exception as e:
         await update.message.reply_text("❌ Backup failed: %s" % html.escape(str(e)[:120]))
@@ -5911,13 +5999,31 @@ async def restore_cmd(update, context):
         n = 0
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             for name in z.namelist():
-                if "/" in name or "\\" in name or not name.startswith("%s_" % uid):
+                if "/" in name or "\\" in name:
                     continue
-                if not name.endswith((".json", ".log")):
+                if not name.startswith("%s_" % uid):
                     continue
-                with z.open(name) as src, open(DATA_DIR / name, "wb") as dst:
-                    dst.write(src.read())
-                n += 1
+                data = z.read(name)
+                if name.endswith("_data.json"):
+                    try:
+                        obj = json.loads(data.decode("utf-8"))
+                    except Exception:
+                        continue
+                    with open(DATA_DIR / name, "w", encoding="utf-8") as fh:
+                        fh.write(data.decode("utf-8"))
+                    try:
+                        await STORAGE.put_json_async("user:%d:data" % uid, obj)
+                    except Exception as e:
+                        logger.warning("restore storage user data: %s", e)
+                    n += 1
+                elif name.endswith(".log"):
+                    with open(DATA_DIR / name, "wb") as fh:
+                        fh.write(data)
+                    try:
+                        await STORAGE.put_bytes("logs:%d" % uid, bytes(data), "text/plain")
+                    except Exception as e:
+                        logger.warning("restore storage log: %s", e)
+                    n += 1
         USER_DATA_CACHE.pop(uid, None)
         ud = get_user_data(uid)
         await msg.reply_text(
@@ -6051,16 +6157,35 @@ def auto_clear_cache():
 
 async def check_resume_tasks(app: Application):
     await asyncio.sleep(3)
-    data_dir = DATA_DIR
-    if not data_dir.exists():
-        return
-    for f in sorted(data_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-        if f.suffix != ".json" or not f.stem.isdigit():
+    records = {}
+    for key in STORAGE.list_keys("user:"):
+        if not key.endswith(":data"):
             continue
         try:
-            uid = int(f.stem)
-            with open(f) as fh:
-                d = json.load(fh)
+            uid = int(key.split(":")[1])
+        except Exception:
+            continue
+        d = STORAGE.get_json(key)
+        if isinstance(d, dict):
+            records[uid] = d
+    local_only = False
+    if not records and DATA_DIR.exists():
+        local_only = True
+        for f in sorted(DATA_DIR.glob("*_data.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+            if not f.stem.isdigit():
+                continue
+            try:
+                with open(f) as fh:
+                    records[int(f.stem)] = json.load(fh)
+            except Exception:
+                continue
+    for uid, d in records.items():
+        if local_only:
+            try:
+                await STORAGE.put_json_async("user:%d:data" % uid, d)
+            except Exception as e:
+                logger.warning("migrate local user %s to storage: %s", uid, e)
+        try:
             tasks_to_resume = []
             if d.get("rej", {}).get("running"):
                 tasks_to_resume.append("🔄 Rejoin Cycle")
@@ -6088,7 +6213,7 @@ async def check_resume_tasks(app: Application):
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(kb))
         except Exception as e:
-            logger.error(f"Resume check for {f}: {e}")
+            logger.error(f"Resume check for {uid}: {e}")
 
 async def scraper_help_cmd(update, context):
     if not is_authorized(update.effective_user.id): return
@@ -6218,15 +6343,71 @@ def _start_keep_alive():
     logger.info(f"Self-ping keep-alive started: {url} every {interval}s")
 
 
+def apply_api_config(cfg):
+    global API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+    try:
+        API_ID = int(cfg.get("api_id", API_ID))
+        API_HASH = cfg.get("api_hash", API_HASH)
+        BOT_TOKEN = cfg.get("bot_token", BOT_TOKEN)
+        OWNER_ID = int(cfg.get("owner_id", OWNER_ID))
+        logger.info("API config applied from Telegram storage")
+    except Exception as e:
+        logger.warning("apply_api_config failed: %s", e)
+
+async def _storage_retry(app):
+    for attempt in range(60):
+        await asyncio.sleep(60)
+        if STORAGE.available:
+            return
+        try:
+            if await STORAGE.initialize(app.bot):
+                logger.info("Telegram storage connected after retry")
+                try:
+                    await send_alert(app.bot, OWNER_ID,
+                        "Telegram storage connected. Data ab channel me persist hoga.")
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            logger.warning("storage retry failed: %s", e)
+
 def main():
     _start_keep_alive()
+    if not (os.environ.get("STORAGE_NAMESPACE") or "").strip():
+        STORAGE.namespace = "bot-%s" % hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:10]
+    if not (os.environ.get("STORAGE_CHANNEL_ID") or "").strip():
+        logger.warning("STORAGE_CHANNEL_ID not set — Telegram storage disabled, local cache only")
 
     async def _post_init(application):
+        try:
+            ok = await STORAGE.initialize(application.bot)
+            if ok:
+                cfg = STORAGE.get_json("config:api")
+                if isinstance(cfg, dict) and cfg:
+                    try:
+                        apply_api_config(cfg)
+                    except Exception:
+                        pass
+                logger.info("Telegram storage online: %s", STORAGE.status())
+            else:
+                logger.error("Telegram storage OFFLINE: %s", STORAGE.last_error)
+                application.create_task(_storage_retry(application))
+        except Exception as e:
+            logger.error("Storage init crash: %s", e)
+            application.create_task(_storage_retry(application))
         application.create_task(check_resume_tasks(application))
+
+    async def _post_shutdown(application):
+        try:
+            await asyncio.wait_for(STORAGE.flush(), timeout=25)
+            logger.info("Telegram storage flushed on shutdown")
+        except Exception as e:
+            logger.error("Storage flush on shutdown failed: %s", e)
 
     app = (Application.builder()
            .token(BOT_TOKEN)
            .post_init(_post_init)
+           .post_shutdown(_post_shutdown)
            .build())
 
     auto_clear_cache()
@@ -6241,6 +6422,7 @@ def main():
     app.add_handler(CommandHandler("users", listusers_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(CommandHandler("storage", storage_cmd))
     
     async def _bh(update, context):
         r = await button_handler(update, context)

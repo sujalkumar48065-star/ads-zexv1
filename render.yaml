@@ -17,3 +17,7 @@ services:
         sync: false
       - key: SELF_PING_INTERVAL
         value: "600"
+      - key: STORAGE_CHANNEL_ID
+        sync: false
+      - key: STORAGE_NAMESPACE
+        value: ads-zexv1
