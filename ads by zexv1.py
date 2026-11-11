@@ -15,7 +15,7 @@ for pkg_name, import_name in PACKAGE_MAP.items():
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name, "-q"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-import asyncio, json, logging, re, random, os, html, time
+import asyncio, json, logging, re, random, os, html, time, io, zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Set
@@ -32,13 +32,14 @@ from telethon.errors import (SessionPasswordNeededError, FloodWaitError,
     ChannelPrivateError, ChannelInvalidError, InviteHashExpiredError,
     InviteHashInvalidError, UserAlreadyParticipantError, ChatWriteForbiddenError,
     UserPrivacyRestrictedError, UserNotMutualContactError, UserChannelsTooMuchError,
-    UserKickedError, ChatAdminRequiredError, PeerFloodError)
+    UserKickedError, ChatAdminRequiredError, PeerFloodError,
+    UsernameNotOccupiedError, UsernameInvalidError, ChatForbiddenError)
 from telethon.tl.functions.channels import (JoinChannelRequest, LeaveChannelRequest,
     GetFullChannelRequest, GetParticipantsRequest, InviteToChannelRequest)
 from telethon.tl.functions.messages import (ImportChatInviteRequest,
-    CheckChatInviteRequest)
+    CheckChatInviteRequest, AddChatUserRequest)
 from telethon.tl.types import (ChatInviteAlready, InputPeerChannel, ChannelParticipantsSearch,
-    InputPeerUser)
+    InputPeerUser, Channel, Chat)
 from telethon import functions
 from telethon.sessions import StringSession
 
@@ -120,7 +121,7 @@ load_api_config()
   GROUP_SET, GROUP_USER_INPUT, SCRAP_GIRLS_QTY, SCRAP_GIRLS_DELAY,
    GM_WELCOME, GM_RULES, GM_FILTER, GM_AF_MSGS, GM_AF_INT, GM_WARN_SET, BAN_GROQ, BAN_TARGET, BAN_SCAN_COUNT,
     BAN_REPORT_COUNT, BAN_REPORT_INTERVAL,
-     SCRAP_USER_GAP, SCRAP_DAILY_LIMIT, AUTH_USER_ADD) = range(40)
+     SCRAP_USER_GAP, SCRAP_DAILY_LIMIT, AUTH_USER_ADD, SCRAP_GIRL_KW) = range(41)
 
 active_tasks: Dict[int, Dict[str, asyncio.Task]] = {}
 BOT_START_TIME = datetime.now()
@@ -1153,7 +1154,9 @@ class UserData:
             "scraper": {"target":"","delivery":"","gap":3,"running":False,"scraped":0,
                         "user_gap":60,"daily_limit":0,"scraped_today":0,"last_scrape_date":"",
                         "mode":"send","add_gap":20,"add_running":False,"pending":[],
-                        "add_added":0,"add_failed":0},
+                        "add_added":0,"add_failed":0,"member_mode":"all","girl_keywords":"",
+                        "added_uids":[],"source_used":"","found_total":0,"last_error":"",
+                        "per_acc":{},"add_skipped":0},
             "gm": {"group_id":0,"group_title":"","notify":True,"join_reply":True,
                    "join_reply_text":"{username} Your request is received to join {grouptitle} received sweetie and it will accept soon.",
                    "welcome_enabled":False,"welcome_text":"Welcome {name} to {title}!",
@@ -1259,8 +1262,11 @@ async def get_client(phone, user_data) -> Optional[TelegramClient]:
     CLIENT_ERRORS[phone] = last_err
     return None
 
+RESOLVE_ERRORS: Dict[str, str] = {}
+
 async def resolve_entity(client, link):
     """Resolve a public/invite link to an entity without failing on already-joined."""
+    RESOLVE_ERRORS.pop(link, None)
     try:
         if "t.me/+" in link or "joinchat" in link:
             h = link.split("/")[-1].replace("+", "")
@@ -1279,11 +1285,30 @@ async def resolve_entity(client, link):
                     return await client.get_entity(link)
                 except Exception:
                     pass
+            RESOLVE_ERRORS[link] = "invite link expire/invalid hai — naya link bhejo"
             return None
         return await client.get_entity(link)
     except Exception as e:
         logger.warning(f"resolve_entity({link}): {e}")
+        RESOLVE_ERRORS[link] = _resolve_fail_reason(e)
         return None
+
+def _resolve_fail_reason(e):
+    if isinstance(e, (InviteHashExpiredError, InviteHashInvalidError, ValueError)):
+        return "invite link expire ya invalid hai — naya link bhejo"
+    if isinstance(e, ChannelPrivateError):
+        return "group private hai ya account member nahi hai — pehle account se group join karo"
+    if isinstance(e, ChatForbiddenError):
+        return "account group me banned/blocked hai"
+    if isinstance(e, ChatAdminRequiredError):
+        return "member list dekhne ke liye admin permission chahiye"
+    if isinstance(e, UsernameNotOccupiedError):
+        return "username exist nahi karta — spelling check karo ya poora link do"
+    if isinstance(e, UsernameInvalidError):
+        return "username/link invalid hai — dobara check karo"
+    if isinstance(e, FloodWaitError):
+        return "Telegram flood wait %ds — thodi der baad try karo" % int(getattr(e, "seconds", 0))
+    return "%s: %s" % (type(e).__name__, str(e)[:100])
 
 async def get_discussion_group(client, channel_entity):
     try:
@@ -1496,11 +1521,19 @@ def scraper_menu(ud):
     pend = len(s.get("pending", []))
     add_label = ("⏹️  Stop Adding" if s.get("add_running")
                  else "🚀  Add Pending (%d)" % pend)
+    mm = s.get("member_mode", "all")
+    def _mbtn(label, key):
+        return InlineKeyboardButton(("✅ " if mm == key else "") + label,
+                                    callback_data="scraper_mmode_" + key)
+    kw = (s.get("girl_keywords") or "").strip()
+    kw_label = (kw[:14] + "…") if len(kw) > 15 else (kw or "auto-detect")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(sts, callback_data="scraper_toggle"),
          InlineKeyboardButton("📊  Stats", callback_data="scraper_stats")],
         [InlineKeyboardButton("🎯  Target", callback_data="scraper_target"),
          InlineKeyboardButton("📤  Delivery", callback_data="scraper_delivery")],
+        [_mbtn("👥 All", "all"), _mbtn("👩 Girls", "girls"), _mbtn("🔥 Active", "active")],
+        [InlineKeyboardButton("🏷️  Girls Keywords: %s" % kw_label, callback_data="scraper_girl_kw")],
         [InlineKeyboardButton("🔀  Mode: %s" % mode_label, callback_data="scraper_mode_toggle")],
         [InlineKeyboardButton("⏱️  Batch Gap: %ds" % s.get("gap", 3), callback_data="scraper_set_gap")],
         [InlineKeyboardButton("👤  User Gap: %s" % ug_label, callback_data="scraper_user_gap"),
@@ -1636,8 +1669,11 @@ async def show_dashboard(update, context):
             "     ✅ %d joined   ↩️ %d left   ⚠️ %d failed\n"
             "     📋 %d groups   🚫 %d blocked   🔄 %s cycles\n"
             "     💓 %s%s\n\n"
-            "👥  <b>SCRAPER</b>  —  %s\n"
-            "     👤 %d scraped   📥 %d pending add\n\n"
+            "👥  <b>SCRAPER</b>  —  %s%s\n"
+            "     🔎 %s  •  source: %s\n"
+            "     👤 %d scraped   📥 %d pending\n"
+            "     ✅ %d added  ❌ %d failed  ⏭️ %d skipped\n"
+            "     ♻️ %s\n\n"
             "🚨  <b>BANNING</b>  —  %s\n"
             "     📋 %d reports\n\n"
             "━━━━━━━━━━━━━━━━━━\n"
@@ -1650,7 +1686,12 @@ async def show_dashboard(update, context):
                (r.get("last_heartbeat") or "—"),
                ("   ⚠️ <code>%s</code>" % html.escape(str(r.get("last_error"))[:100]) if r.get("last_error") else ""),
                ("🟢 RUNNING" if s_live else "🔴 STOPPED"),
+               ("  +  ➕ ADDING" if s.get("add_running") else ""),
+               {"all": "👥 All members", "girls": "👩 Only girls", "active": "🔥 Active"}.get(s.get("member_mode", "all"), "👥 All members"),
+               (s.get("source_used") or "—"),
                s.get("scraped", 0), add_pending,
+               s.get("add_added", 0), s.get("add_failed", 0), s.get("add_skipped", 0),
+               (", ".join("…%s=%d" % (k, v) for k, v in (s.get("per_acc") or {}).items()) or "—"),
                ("🟢 RUNNING" if b.get("running") else "🔴 STOPPED"),
                len(b.get("reports", [])),
                get_uptime())
@@ -1688,11 +1729,13 @@ async def show_help(update, context):
             "📌  <b>Commands</b>\n"
             "  /start   →  Open main menu\n"
             "  /stats   →  Quick stats\n"
-            "  /cleanup →  Remove dead accounts\n\n"
+            "  /cleanup →  Remove dead accounts\n"
+            "  /backup  →  Data zip download (accounts + groups)\n"
+            "  /restore →  Backup zip reply karke import\n\n"
             "📌  <b>Features</b>\n"
             "  👤  <b>Accounts</b>    —  Add & manage your Telegram accounts\n"
             "  🔄  <b>Rejoin</b>      —  Auto join/leave groups in cycles\n"
-            "  👥  <b>Scraper</b>     —  Scrape members/usernames from groups\n"
+            "  👥  <b>Scraper</b>     —  Scrape all / only-girls / active members\n"
             "  👩  <b>Scrap Girls</b>  —  Filter & scrape Indian girl profiles\n"
             "  ⚙️  <b>Group Manager</b> —  Admin actions, filters, antiflood, welcome, rules, invites\n"
             "  🚨  <b>Banning</b>    —  AI-powered policy violation reviewer\n"
@@ -1701,6 +1744,8 @@ async def show_help(update, context):
             "  •  Safe mode = human-like delays (5-10s)\n"
             "  •  Set realistic gaps to avoid bans\n"
             "  •  Multi-Acc = every account covers every group (parallel, staggered)\n"
+            "  •  Scraper add = round-robin accounts; gap sirf success ke baad\n"
+            "  •  Scraper categories: All members, Only girls (keywords), Active members\n"
             "  •  Use proxy for better security\n"
             "━━━━━━━━━━━━━━━━━━"
         )
@@ -2025,8 +2070,128 @@ async def rejoin_cycle_task(user_id, phone, bot, groups_override=None, slot=0, t
 # BACKGROUND TASK - SCRAPER
 # ═══════════════════════════════════════════════════════════════════
 
+async def _scrape_participants(client, entity, s, seen_ids):
+    users = []
+    offset = 0
+    limit = 200
+    empty = 0
+    while s.get("running"):
+        try:
+            parts = await client(GetParticipantsRequest(
+                entity, ChannelParticipantsSearch(''), offset, limit))
+        except Exception as e:
+            logger.warning(f"participant fetch failed: {e}")
+            break
+        if not getattr(parts, "users", None):
+            break
+        page_new = 0
+        for u in parts.users:
+            if getattr(u, "bot", False) or getattr(u, "deleted", False):
+                continue
+            uid = getattr(u, "id", None)
+            if not uid or uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+            users.append(u)
+            page_new += 1
+        offset += len(parts.users)
+        if page_new == 0:
+            empty += 1
+            if empty >= 2:
+                break
+        else:
+            empty = 0
+        if len(parts.users) < limit:
+            break
+        await asyncio.sleep(max(1, int(s.get("gap", 3))))
+    return users
+
+
+async def _scrape_deep_scan(client, entity, s, seen_ids, bot, user_id, acc, cap=20000, rank=False):
+    users = []
+    counts = {}
+    scanned = 0
+    try:
+        async for msg in client.iter_messages(entity, limit=cap):
+            if not s.get("running"):
+                break
+            scanned += 1
+            sender = getattr(msg, "sender", None)
+            if sender is None:
+                sid = getattr(msg, "sender_id", None)
+                if sid:
+                    try:
+                        sender = await client.get_entity(sid)
+                    except Exception:
+                        sender = None
+            if sender and not getattr(sender, "bot", False) and not getattr(sender, "deleted", False):
+                uid = getattr(sender, "id", None)
+                if uid and uid not in seen_ids:
+                    seen_ids.add(uid)
+                    users.append(sender)
+                    counts[uid] = counts.get(uid, 0) + 1
+                elif uid:
+                    counts[uid] = counts.get(uid, 0) + 1
+            act = getattr(msg, "action", None)
+            if act is not None and hasattr(act, "users"):
+                for au in getattr(act, "users", []) or []:
+                    uid = getattr(au, "id", None)
+                    if not uid or uid in seen_ids:
+                        continue
+                    try:
+                        au2 = await client.get_entity(uid)
+                    except Exception:
+                        continue
+                    if getattr(au2, "bot", False) or getattr(au2, "deleted", False):
+                        continue
+                    seen_ids.add(uid)
+                    users.append(au2)
+            if scanned % 500 == 0:
+                await notify_progress(bot, user_id,
+                    "🔎 <b>DEEP SCAN</b>  •  acct …%s\n"
+                    "messages checked: <b>%d</b>  •  users found: <b>%d</b>"
+                    % (acc, scanned, len(users)))
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"deep scan error: {e}")
+    if rank:
+        users.sort(key=lambda u: counts.get(getattr(u, "id", None), 0), reverse=True)
+    return users
+
+
+def _girl_keywords(s):
+    raw = (s.get("girl_keywords") or "").strip().lower()
+    if not raw:
+        return []
+    return [k.strip() for k in re.split(r"[,;\s]+", raw) if k.strip()]
+
+
+MALE_NAME_HINTS = {"krishna", "raja", "baba", "anna", "ravi", "hari", "shani",
+                   "gopi", "munna", "chotu", "sonu", "monu", "raju", "vijay"}
+
+def _is_girl(u, kws):
+    name = ((getattr(u, "first_name", "") or "") + " " +
+            (getattr(u, "last_name", "") or "")).strip().lower()
+    uname = (getattr(u, "username", "") or "").lower()
+    if kws:
+        return any(k in name or k in uname for k in kws)
+    if not name:
+        return False
+    if name in MALE_NAME_HINTS:
+        return False
+    strong = ("a", "ee", "iya", "ika", "ita", "ina", "isha", "esha",
+              "ani", "ini", "ati", "devi", "rani", "kaur", "kumari", "bai")
+    return any(name.endswith(suf) for suf in strong)
+
+
 async def scraper_task(user_id, phone, bot):
     ud = get_user_data(user_id); s = ud.data["scraper"]
+    for k, v in (("member_mode", "all"), ("girl_keywords", ""), ("added_uids", []),
+                 ("source_used", ""), ("found_total", 0), ("last_error", ""),
+                 ("per_acc", {}), ("add_skipped", 0)):
+        s.setdefault(k, v)
     client = await get_client(phone, ud)
     if not client:
         reason = CLIENT_ERRORS.get(phone, "connection failed")
@@ -2036,7 +2201,7 @@ async def scraper_task(user_id, phone, bot):
         await notify_progress(bot, user_id,
             "❌ <b>SCRAPER STOPPED — ACCOUNT CONNECT FAILED</b>\n"
             "👤 account: <code>…%s</code>\n⚠️ reason: <code>%s</code>\n\n"
-            "Re-login the account or disable proxy and try again."
+            "Account dobara login karo ya proxy band karke try karo."
             % (phone[-4:], html.escape(reason[:160])))
         if user_id in active_tasks:
             active_tasks[user_id].pop("scraper", None)
@@ -2045,189 +2210,227 @@ async def scraper_task(user_id, phone, bot):
     try:
         target_entity = await resolve_entity(client, s["target"])
         if target_entity is None:
+            reason = RESOLVE_ERRORS.get(s["target"], "chat access nahi mila")
+            s["running"] = False
+            s["last_error"] = reason
+            ud.save()
             await notify_progress(bot, user_id,
-                "❌  <b>CANNOT ACCESS TARGET</b>\n<code>%s</code>"
-                % html.escape(s["target"][:80]))
-            s["running"] = False; ud.save(); return
+                "❌ <b>TARGET GROUP ACCESS FAILED</b>\n"
+                "🔗 <code>%s</code>\n⚠️ reason: <code>%s</code>\n\n"
+                "<b>Fix:</b> group exist karta hai? Account us group ka member hai? "
+                "Private group hai to pehle account se join karo."
+                % (html.escape(s["target"][:80]), html.escape(reason[:160])))
+            return
 
         delivery_entity = await resolve_entity(client, s["delivery"])
         if delivery_entity is None:
+            reason = RESOLVE_ERRORS.get(s["delivery"], "chat access nahi mila")
+            s["running"] = False
+            s["last_error"] = reason
+            ud.save()
             await notify_progress(bot, user_id,
-                "❌  <b>CANNOT ACCESS DELIVERY</b>\n<code>%s</code>"
-                % html.escape(s["delivery"][:80]))
-            s["running"] = False; ud.save(); return
+                "❌ <b>DELIVERY GROUP ACCESS FAILED</b>\n"
+                "🔗 <code>%s</code>\n⚠️ reason: <code>%s</code>\n\n"
+                "<b>Fix:</b> delivery group valid hai? Account member/admin hai? "
+                "Private link expire ho gaya ho to naya link do."
+                % (html.escape(s["delivery"][:80]), html.escape(reason[:160])))
+            return
 
-        # Daily limit check
         today = datetime.now().strftime("%Y-%m-%d")
         if s.get("last_scrape_date") != today:
             s["scraped_today"] = 0
             s["last_scrape_date"] = today
             ud.save()
 
-        all_users = []
-        seen_ids = set()
-        scraped_by_message = False
+        mode = s.get("member_mode", "all")
+        if mode not in ("all", "girls", "active"):
+            mode = "all"
+        mode_label = {"all": "ALL MEMBERS", "girls": "ONLY GIRLS", "active": "ACTIVE MEMBERS"}[mode]
 
-        # Try getting member list first
+        total_members = 0
         try:
             full = await client(GetFullChannelRequest(target_entity.id))
-            total = getattr(full.full_chat, 'participants_count', 0)
-            if total > 0:
-                await notify_progress(bot, user_id,
-                    "👥 <b>MEMBER LIST VISIBLE</b>  •  acct …%s\n"
-                    "🎯 target: <b>%s</b>\n👥 members: <b>%d</b>\nscraping..."
-                    % (acc, html.escape(str(getattr(target_entity, 'title', s['target']))[:40]), total))
-                offset = 0
-                limit = 200
-                last_report = 0
-                while s["running"]:
-                    try:
-                        participants = await client(GetParticipantsRequest(
-                            target_entity, ChannelParticipantsSearch(''), offset, limit))
-                        if not participants.users:
-                            break
-                        page_new = 0
-                        for u in participants.users:
-                            if s["daily_limit"] > 0 and s["scraped_today"] >= s["daily_limit"]:
-                                break
-                            if getattr(u, "bot", False) or getattr(u, "deleted", False):
-                                continue
-                            if u.id in seen_ids:
-                                continue
-                            seen_ids.add(u.id)
-                            if u.username:
-                                all_users.append(u.username)
-                            elif u.id:
-                                all_users.append(str(u.id))
-                            else:
-                                continue
-                            page_new += 1
-                            s["scraped_today"] += 1
-                        offset += len(participants.users)
-                        if page_new == 0:
-                            break
-                        s["scraped"] = len(all_users)
-                        ud.save()
-                        if len(all_users) - last_report >= 1000:
-                            last_report = len(all_users)
-                            await notify_progress(bot, user_id,
-                                "⏳ <b>SCRAPE PROGRESS</b>  •  acct …%s\n"
-                                "👥 collected: <b>%d</b> / ~%d"
-                                % (acc, len(all_users), total))
-                        await asyncio.sleep(max(1, int(s["gap"])))
-                        if s["daily_limit"] > 0 and s["scraped_today"] >= s["daily_limit"]:
-                            break
-                    except Exception as e:
-                        logger.error(f"Scraper participant iteration: {e}")
-                        break
-        except Exception as e:
-            logger.info(f"Member list hidden, switching to message scan: {e}")
+            total_members = getattr(full.full_chat, "participants_count", 0) or 0
+        except Exception:
+            total_members = 0
 
-        # Fallback: scan messages if member list failed or got no users
-        if not all_users and s["running"]:
-            scraped_by_message = True
-            await notify_progress(bot, user_id,
-                "🔍 <b>MEMBER LIST HIDDEN</b>  •  acct …%s\n"
-                "scanning recent messages for users..." % acc)
-            seen_ids = set()
-            try:
-                msg_limit = max(s.get("daily_limit", 0) * 2, 500) if s.get("daily_limit", 0) > 0 else 5000
-                async for msg in client.iter_messages(target_entity, limit=msg_limit):
-                    if not s["running"]:
-                        break
-                    if s["daily_limit"] > 0 and s["scraped_today"] >= s["daily_limit"]:
-                        break
-                    sender = msg.sender
-                    if not sender or getattr(sender, 'bot', False) or sender.id in seen_ids:
-                        continue
-                    seen_ids.add(sender.id)
-                    uname = sender.username
-                    if uname:
-                        all_users.append(uname)
-                    elif sender.id:
-                        all_users.append(str(sender.id))
-                    s["scraped_today"] += 1
-                    s["scraped"] = len(all_users)
-                    ud.save()
-                    if s["daily_limit"] > 0 and s["scraped_today"] >= s["daily_limit"]:
-                        break
-            except Exception as e:
-                logger.error(f"Scraper message scan error: {e}")
+        title = getattr(target_entity, "title", None) or s["target"]
+        await notify_progress(bot, user_id,
+            "🚀 <b>SCRAPER STARTED</b>  •  acct …%s\n"
+            "🎯 target: <b>%s</b>\n"
+            "🔎 mode: <b>%s</b>\n"
+            "👥 group members: <b>%s</b>\n"
+            "⏳ fetching list..."
+            % (acc, html.escape(str(title)[:45]), mode_label,
+               (total_members if total_members else "hidden/unknown")))
 
-        # Deliver / hand off to add-mode
-        if all_users and s["running"]:
-            if s.get("mode", "send") == "add":
-                s["pending"] = all_users
-                s["add_added"] = 0
-                s["add_failed"] = 0
-                ud.save()
+        seen_ids = set()
+        raw = []
+        used_member_api = False
+        if mode in ("all", "girls"):
+            raw = await _scrape_participants(client, target_entity, s, seen_ids)
+            used_member_api = len(raw) > 0
+
+        need_scan = (mode == "active") or (not raw)
+        if need_scan:
+            if mode == "active":
                 await notify_progress(bot, user_id,
-                    "📦 <b>SCRAPE READY</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "🎯 target: <code>%s</code>\n"
-                    "📤 add to: <code>%s</code>\n"
-                    "👥 members found: <b>%d</b>\n"
-                    "🔎 source: %s\n\n"
-                    "Add these members to your group now?"
-                    % (html.escape(s["target"][:45]), html.escape(s["delivery"][:45]),
-                       len(all_users),
-                       "message scan" if scraped_by_message else "member list"))
-                try:
-                    await bot.send_message(chat_id=user_id,
-                        text="👇 <b>CONFIRM ADD</b>",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("✅  Add now", callback_data="scrap_add_yes"),
-                            InlineKeyboardButton("❌  Cancel", callback_data="scrap_add_no")]]))
-                except Exception:
-                    pass
+                    "🔥 <b>ACTIVE MEMBER SCAN</b>  •  acct …%s\n"
+                    "recent messages + joins se active users nikal rahe hain..." % acc)
             else:
-                user_gap = max(s.get("user_gap", 60), 1)
-                added = 0
-                failed = 0
-                for uid_val in all_users:
-                    if not s["running"]:
-                        break
-                    try:
-                        mention = f"@{uid_val}" if not uid_val.startswith("-") and uid_val.isdigit() == False else uid_val
-                        await client.send_message(delivery_entity, mention)
-                        added += 1
-                    except Exception as e:
-                        failed += 1
-                        logger.warning(f"Failed to send user {uid_val}: {e}")
-                    if added < len(all_users):
-                        await asyncio.sleep(int(user_gap))
-
                 await notify_progress(bot, user_id,
-                    "✅ <b>SCRAPE COMPLETE</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "👤 found: %d\n✅ sent: %d\n❌ failed: %d\n"
-                    "🔎 source: %s\n📤 delivery: %s"
-                    % (len(all_users), added, failed,
-                       "message scan" if scraped_by_message else "member list",
-                       html.escape(s["delivery"][:45])))
-        else:
+                    "🔍 <b>MEMBER LIST HIDDEN / EMPTY</b>  •  acct …%s\n"
+                    "deep message scan chalu — senders + join events se users nikal rahe hain..." % acc)
+            scanned = await _scrape_deep_scan(client, target_entity, s, seen_ids, bot, user_id, acc,
+                                              rank=(mode == "active"))
+            known = set(getattr(u, "id", None) for u in raw)
+            for u in scanned:
+                if getattr(u, "id", None) not in known:
+                    raw.append(u)
+                    known.add(getattr(u, "id", None))
+            if not used_member_api and raw:
+                used_member_api = False
+
+        if s.get("daily_limit", 0) > 0:
+            remain = max(0, int(s["daily_limit"]) - int(s.get("scraped_today", 0)))
+            if remain and len(raw) > remain:
+                raw = raw[:remain]
+
+        kws = _girl_keywords(s)
+        if mode == "girls":
+            filtered = [u for u in raw if _is_girl(u, kws)]
+            raw = filtered
+
+        added_set = set(str(x) for x in s.get("added_uids", []))
+        final = []
+        seen_out = set()
+        for u in raw:
+            uid = getattr(u, "id", None)
+            if not uid:
+                continue
+            uname = getattr(u, "username", None)
+            ident = uname if uname else str(uid)
+            if str(uid) in added_set or ident in added_set or ident in seen_out:
+                continue
+            seen_out.add(ident)
+            final.append(ident)
+
+        source = "member list API" if used_member_api else "deep message scan"
+        s["source_used"] = source
+        s["found_total"] = len(raw)
+        s["scraped"] = len(final)
+        s["scraped_today"] = int(s.get("scraped_today", 0)) + len(final)
+        s["last_error"] = ""
+        ud.save()
+
+        if not final:
+            why = ("koi member match nahi hua (keywords ya filter check karo)"
+                   if mode == "girls" else
+                   "member list hidden hai aur message scan me koi user nahi mila")
             await notify_progress(bot, user_id,
                 "❌ <b>NO USERS SCRAPED</b>\n"
-                "target: <code>%s</code>" % html.escape(s["target"][:45]))
-    except asyncio.CancelledError: pass
+                "🎯 target: <code>%s</code>\n"
+                "🔎 mode: %s\n"
+                "👥 raw found: %d\n"
+                "⚠️ %s\n\n"
+                "<b>Tip:</b> account ko group admin banao (member list ke liye), "
+                "ya 'Active Members' mode try karo."
+                % (html.escape(s["target"][:60]), mode_label, len(raw), why))
+        elif s.get("mode", "send") == "add":
+            s["pending"] = final
+            s["add_added"] = 0
+            s["add_failed"] = 0
+            s["add_skipped"] = 0
+            ud.save()
+            await notify_progress(bot, user_id,
+                "📦 <b>SCRAPE READY</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🎯 target: <code>%s</code>\n"
+                "📤 add to: <code>%s</code>\n"
+                "🔎 mode: <b>%s</b>  •  source: %s\n"
+                "👥 group total: %s  •  found: %d\n"
+                "🚫 already added (skip): %d\n\n"
+                "Multi-account round-robin add shuru karein?"
+                % (html.escape(s["target"][:45]), html.escape(s["delivery"][:45]),
+                   mode_label, source,
+                   (total_members if total_members else "?"),
+                   len(final), len(raw) - len(final)))
+            try:
+                await bot.send_message(chat_id=user_id,
+                    text="👇 <b>CONFIRM ADD</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅  Add now", callback_data="scrap_add_yes"),
+                        InlineKeyboardButton("❌  Cancel", callback_data="scrap_add_no")]]))
+            except Exception:
+                pass
+        else:
+            user_gap = max(s.get("user_gap", 60), 1)
+            added = 0
+            failed = 0
+            for uid_val in final:
+                if not s["running"]:
+                    break
+                try:
+                    mention = ("@" + uid_val) if not str(uid_val).lstrip("-").isdigit() else str(uid_val)
+                    await client.send_message(delivery_entity, mention)
+                    added += 1
+                except FloodWaitError as e:
+                    await asyncio.sleep(int(getattr(e, "seconds", 5)) + 2)
+                    try:
+                        await client.send_message(delivery_entity, mention)
+                        added += 1
+                    except Exception as e2:
+                        failed += 1
+                        logger.warning(f"send user {uid_val} failed: {e2}")
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"Failed to send user {uid_val}: {e}")
+                if added < len(final):
+                    await asyncio.sleep(int(user_gap))
+
+            await notify_progress(bot, user_id,
+                "✅ <b>SCRAPE COMPLETE</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🔎 mode: %s  •  source: %s\n"
+                "👤 found: %d\n✅ sent: %d\n❌ failed: %d\n"
+                "📤 delivery: %s"
+                % (mode_label, source, len(final), added, failed,
+                   html.escape(s["delivery"][:45])))
+    except asyncio.CancelledError:
+        pass
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         s["running"] = False
         ud.save()
         if user_id in active_tasks:
             active_tasks[user_id].pop("scraper", None)
 
 def _add_fail_reason(e):
-    if isinstance(e, UserPrivacyRestrictedError): return "privacy — invites restricted"
-    if isinstance(e, UserNotMutualContactError): return "not a mutual contact"
-    if isinstance(e, UserChannelsTooMuchError): return "user in too many groups"
-    if isinstance(e, UserAlreadyParticipantError): return "already a member"
-    if isinstance(e, UserKickedError): return "user was kicked/banned"
-    if isinstance(e, ChatAdminRequiredError): return "adder account is not admin"
-    if isinstance(e, PeerFloodError): return "peer flood — too many adds"
-    if isinstance(e, ChatWriteForbiddenError): return "no permission to add"
-    return "%s: %s" % (type(e).__name__, str(e)[:60])
+    if isinstance(e, UserPrivacyRestrictedError):
+        return "user ne privacy me invite band kiya hai"
+    if isinstance(e, UserNotMutualContactError):
+        return "Telegram restriction — sirf mutual contact add ho sakta hai"
+    if isinstance(e, UserChannelsTooMuchError):
+        return "user bahut zyada groups/channels me hai"
+    if isinstance(e, UserAlreadyParticipantError):
+        return "already a member"
+    if isinstance(e, UserKickedError):
+        return "user group se kicked/banned hai"
+    if isinstance(e, ChatAdminRequiredError):
+        return "adder account admin nahi hai / invite permission nahi"
+    if isinstance(e, PeerFloodError):
+        return "peer flood — account pe add limit aa gayi"
+    if isinstance(e, ChatWriteForbiddenError):
+        return "group me add karne ki permission nahi"
+    if isinstance(e, FloodWaitError):
+        return "flood wait %ds" % int(getattr(e, "seconds", 0) or 0)
+    if isinstance(e, (UsernameNotOccupiedError, UsernameInvalidError)):
+        return "username invalid ya exist nahi karta"
+    return "%s: %s" % (type(e).__name__, str(e)[:80])
 
 async def scrap_add_task(user_id, phones, bot):
     ud = get_user_data(user_id); s = ud.data["scraper"]
@@ -2236,116 +2439,218 @@ async def scrap_add_task(user_id, phones, bot):
         s["add_running"] = False; ud.save(); return
     if isinstance(phones, str):
         phones = [phones]
-    client = None; chosen = None; dest = None; dest_title = s["delivery"]
+    for k, v in (("added_uids", []), ("per_acc", {}), ("add_skipped", 0),
+                 ("add_added", 0), ("add_failed", 0)):
+        s.setdefault(k, v)
+
+    pool = []
+    seen_phones = set()
     completed = False
     try:
         for p in phones:
             if not s.get("add_running"):
                 break
+            if p in seen_phones:
+                continue
+            seen_phones.add(p)
             c = await get_client(p, ud)
             if not c:
                 continue
             d = await resolve_entity(c, s["delivery"])
             if d is None:
-                try: await c.disconnect()
-                except Exception: pass
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
                 continue
             admin = True
             try:
-                me_c = await c.get_me()
-                perms = await c.get_permissions(d, me_c)
+                perms = await c.get_permissions(d, await c.get_me())
                 admin = bool(getattr(perms, "is_admin", False))
             except Exception:
                 admin = True
-            if admin:
-                client, chosen, dest = c, p, d
-                break
-            try: await c.disconnect()
-            except Exception: pass
+            if not admin:
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
+                continue
+            pool.append((p, c, d))
 
-        if client is None:
+        if not pool:
+            reason = RESOLVE_ERRORS.get(s.get("delivery", ""), "")
             await notify_progress(bot, user_id,
-                "🛑 <b>ADD ABORTED</b> — koi usable account nahi mila\n"
-                "active account ko delivery group me <b>admin</b> banao, phir try karo.")
-            s["add_running"] = False; ud.save(); return
+                "🛑 <b>ADD ABORTED</b> — koi usable admin account nahi mila\n"
+                "📤 delivery: <code>%s</code>\n%s\n\n"
+                "<b>Fix:</b> kisi active account ko delivery group me <b>admin</b> "
+                "(invite users permission) banao, phir try karo."
+                % (html.escape(str(s.get("delivery", ""))[:60]),
+                   ("⚠️ " + html.escape(reason[:140])) if reason else ""))
+            s["add_running"] = False
+            ud.save()
+            return
 
-        acc = chosen[-4:] if len(chosen) >= 4 else chosen
-        dest_title = getattr(dest, "title", None) or s["delivery"]
+        try:
+            s["destination_is_basic"] = all(isinstance(d, Chat) for _, _, d in pool)
+        except Exception:
+            s["destination_is_basic"] = False
 
+        accs_label = ", ".join("…" + (p[-4:] if len(p) >= 4 else p) for p, _, _ in pool)
+        dest_title = getattr(pool[0][2], "title", None) or s["delivery"]
         await notify_progress(bot, user_id,
-            "🚀 <b>ADD STARTED</b>  •  acct …%s\n"
+            "🚀 <b>ADD STARTED — ROUND ROBIN</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
             "🎯 target: <b>%s</b>\n"
-            "👥 queue: %d\n"
-            "⏱️ gap: %ds\n"
-            "🛡️ adder admin: yes"
-            % (acc, html.escape(str(dest_title)[:45]), len(pending),
-               int(s.get("add_gap", 20))))
+            "👥 accounts: <b>%d</b>  (%s)\n"
+            "📥 queue: %d\n"
+            "⏱️ gap: %ds  (sirf success ke baad)\n"
+            "♻️ fail hone par turant next user — time waste nahi"
+            % (html.escape(str(dest_title)[:45]), len(pool), accs_label,
+               len(pending), int(s.get("add_gap", 20))))
 
-        added = failed = 0
+        added = failed = skipped = 0
         total = len(pending)
         processed = 0
-        completed = False
+        idx = 0
+        added_ids = set(str(x) for x in s.get("added_uids", []))
+        per_acc = dict(s.get("per_acc") or {})
+
+        async def _do_add(c, d, u, ue):
+            if isinstance(d, Chat):
+                uid = getattr(ue, "user_id", None)
+                if not uid:
+                    uid = int(u) if str(u).lstrip("-").isdigit() else None
+                if not uid:
+                    ue2 = await c.get_entity(int(u) if str(u).lstrip("-").isdigit() else u)
+                    uid = ue2.id
+                await c(AddChatUserRequest(d.id, int(uid), 0))
+            else:
+                await c(InviteToChannelRequest(d, [ue]))
+
         for i, u in enumerate(pending, 1):
             if not s.get("add_running"):
                 break
-            ue = None
-            try:
+            if str(u) in added_ids:
+                skipped += 1
+                processed = i
+                s["pending"] = pending[i:]
+                s["add_skipped"] = skipped
+                ud.save()
+                continue
+
+            ok = False
+            skip_now = False
+            last_reason = ""
+            used_acc = None
+            for attempt in range(len(pool)):
+                phone, c, d = pool[(idx + attempt) % len(pool)]
+                used_acc = phone[-4:] if len(phone) >= 4 else phone
+                ue = None
                 try:
-                    ue = await client.get_entity(int(u) if u.lstrip("-").isdigit() else u)
-                except Exception:
-                    ue = await client.get_input_entity(int(u) if u.lstrip("-").isdigit() else u)
-                await client(InviteToChannelRequest(dest, [ue]))
+                    try:
+                        ue = await c.get_entity(int(u) if str(u).lstrip("-").isdigit() else u)
+                    except Exception:
+                        ue = await c.get_input_entity(int(u) if str(u).lstrip("-").isdigit() else u)
+                    await _do_add(c, d, u, ue)
+                    ok = True
+                    idx = (idx + attempt + 1) % len(pool)
+                    break
+                except UserAlreadyParticipantError:
+                    ok = True
+                    skip_now = True
+                    idx = (idx + attempt + 1) % len(pool)
+                    break
+                except FloodWaitError as e:
+                    wait = int(getattr(e, "seconds", 0) or 0)
+                    last_reason = "flood wait %ds" % wait
+                    if wait <= 45:
+                        await asyncio.sleep(wait + 2)
+                        try:
+                            if ue is None:
+                                ue = await c.get_input_entity(int(u) if str(u).lstrip("-").isdigit() else u)
+                            await _do_add(c, d, u, ue)
+                            ok = True
+                            idx = (idx + attempt + 1) % len(pool)
+                            break
+                        except UserAlreadyParticipantError:
+                            ok = True
+                            skip_now = True
+                            idx = (idx + attempt + 1) % len(pool)
+                            break
+                        except Exception as e2:
+                            last_reason = _add_fail_reason(e2)
+                    continue
+                except Exception as e:
+                    last_reason = _add_fail_reason(e)
+                    continue
+
+            if ok and not skip_now:
                 added += 1
+                added_ids.add(str(u))
+                per_acc[used_acc] = per_acc.get(used_acc, 0) + 1
                 await notify_progress(bot, user_id,
-                    "✅ <b>ADDED</b>  •  acct …%s  %d/%d\nuser: %s"
-                    % (acc, i, total, html.escape(str(u))))
-            except FloodWaitError as e:
-                wait = int(e.seconds) + random.randint(1, 3)
+                    "✅ <b>ADDED</b>  •  acct …%s  (%d/%d)\nuser: %s"
+                    % (used_acc, i, total, html.escape(str(u))))
+            elif skip_now:
+                skipped += 1
+                added_ids.add(str(u))
                 await notify_progress(bot, user_id,
-                    "⏳ <b>FLOOD</b> — waiting %ds, retry %d/%d" % (wait, i, total))
-                await asyncio.sleep(wait)
-                try:
-                    if ue is None:
-                        ue = await client.get_input_entity(int(u) if u.lstrip("-").isdigit() else u)
-                    await client(InviteToChannelRequest(dest, [ue]))
-                    added += 1
-                except Exception as e2:
-                    failed += 1
-                    await notify_progress(bot, user_id,
-                        "❌ <b>ADD FAILED</b>  •  %d/%d\nuser: %s\nreason: %s"
-                        % (i, total, html.escape(str(u)), html.escape(_add_fail_reason(e2))))
-            except Exception as e:
+                    "⏭️ <b>SKIPPED</b> — user already group member  •  (%d/%d)\nuser: %s"
+                    % (i, total, html.escape(str(u))))
+            else:
                 failed += 1
+                hint = ""
+                if "mutual" in last_reason.lower():
+                    hint = ("\n💡 Telegram restriction: sirf mutual contact add ho sakta hai. "
+                            "Dusre account se try hoga; phir bhi fail to us account ko 24h rest do.")
+                elif "privacy" in last_reason.lower():
+                    hint = "\n💡 User ne privacy me invite band kiya hai — skip karo."
+                elif "flood" in last_reason.lower():
+                    hint = "\n💡 Account add-limit pe hai — 24h rest ya dusra account."
                 await notify_progress(bot, user_id,
-                    "❌ <b>ADD FAILED</b>  •  acct …%s  %d/%d\nuser: %s\nreason: %s"
-                    % (acc, i, total, html.escape(str(u)), html.escape(_add_fail_reason(e))))
+                    "❌ <b>ADD FAILED</b>  •  (%d/%d)\nuser: %s\nreason: %s%s"
+                    % (i, total, html.escape(str(u)),
+                       html.escape(last_reason or "unknown"), hint))
+
             processed = i
             s["add_added"] = added
             s["add_failed"] = failed
+            s["add_skipped"] = skipped
             s["pending"] = pending[i:]
+            s["added_uids"] = list(added_ids)[-8000:]
+            s["per_acc"] = per_acc
             ud.save()
-            if i < total:
-                await asyncio.sleep(max(1, int(s.get("add_gap", 20))))
 
-        completed = (processed >= total)
+            # Gap ONLY after a successful add. Failures move to the next user fast.
+            if ok and not skip_now:
+                await asyncio.sleep(max(1, int(s.get("add_gap", 20))))
+            else:
+                await asyncio.sleep(1)
+
+        completed = (processed >= total and s.get("add_running"))
         await notify_progress(bot, user_id,
-            "🏁 <b>ADD %s</b>  •  acct …%s\n"
+            "🏁 <b>ADD %s</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
             "🎯 target: <b>%s</b>\n"
-            "👥 queued: %d  •  left: %d\n✅ added: %d\n❌ failed: %d"
-            % ("COMPLETE" if completed else "STOPPED", acc,
-               html.escape(str(dest_title)[:45]), total,
-               max(0, total - processed), added, failed))
+            "👥 queued: %d  •  processed: %d  •  left: %d\n"
+            "✅ added: %d\n⏭️ skipped: %d\n❌ failed: %d\n"
+            "♻️ per account: %s"
+            % ("COMPLETE" if completed else "STOPPED",
+               html.escape(str(dest_title)[:45]), total, processed,
+               max(0, total - processed), added, skipped, failed,
+               ", ".join("…%s=%d" % (k, v) for k, v in per_acc.items())))
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.error(f"scrap_add_task error: {e}")
-        await notify_progress(bot, user_id, "❌ <b>ADD ERROR</b>\n<code>%s</code>"
-            % html.escape(str(e)[:80]))
+        await notify_progress(bot, user_id,
+            "❌ <b>ADD ERROR</b>\n<code>%s</code>" % html.escape(str(e)[:120]))
     finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        for _, c, _ in pool:
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
         s["add_running"] = False
         if completed:
             s["pending"] = []
@@ -3615,8 +3920,12 @@ async def button_handler(update, context):
                 "👥  <b>Member Scraper</b>\n"
                 f"  Status:   {'🟢  RUNNING' if s['running'] else '🔴  STOPPED'}\n"
                 f"  Target:   {s['target'][:25] or 'Not set'}\n"
+                f"  Scrape:   { {'all':'👥 All members','girls':'👩 Only girls','active':'🔥 Active'}.get(s.get('member_mode','all'),'All') }\n"
+                f"  Source:   {s.get('source_used') or '—'}  •  found {s.get('found_total', 0)}\n"
                 f"  Mode:     {'ADD' if s.get('mode','send')=='add' else 'SEND'}\n"
                 f"  Scraped:  {s['scraped']}  (pending {len(s.get('pending', []))})\n"
+                f"  Add:      ✅ {s.get('add_added',0)}  ❌ {s.get('add_failed',0)}  ⏭️ {s.get('add_skipped',0)}\n"
+                f"  Accounts: {', '.join('…%s=%d' % (k,v) for k,v in (s.get('per_acc') or {}).items()) or '—'}\n"
                 f"  Gap:      {s['gap']}s\n\n"
                 "👩  <b>Girls Scraper</b>\n"
                 f"  Status:   {'🟢  RUNNING' if sg['running'] else '🔴  STOPPED'}\n"
@@ -4371,6 +4680,7 @@ async def button_handler(update, context):
                         "━━━━━━━━━━━━━━━━━━\n\n"
                         f"🎯  Target:   {s['target'][:30]}\n"
                         f"📤  Delivery: {s['delivery'][:30]}\n"
+                        f"🔎  Scrape:   { {'all':'👥 All members','girls':'👩 Only girls','active':'🔥 Active'}.get(s.get('member_mode','all'),'All') }\n"
                         f"🔀  Mode:     {'ADD' if s.get('mode','send')=='add' else 'SEND'}\n"
                         f"⏱️  Gap:      {s['gap']}s",
                         parse_mode=ParseMode.HTML, reply_markup=scraper_menu(ud))
@@ -4389,6 +4699,28 @@ async def button_handler(update, context):
                 parse_mode=ParseMode.HTML)
             log_activity(user_id, "Setting scraper gap")
             return SCRAP_GAP
+        elif data.startswith("scraper_mmode_"):
+            s = ud.data["scraper"]
+            mm = data.rsplit("_", 1)[-1]
+            if mm in ("all", "girls", "active"):
+                s["member_mode"] = mm
+                ud.save()
+                log_activity(user_id, f"Scraper member mode -> {mm}")
+            await query.edit_message_reply_markup(reply_markup=scraper_menu(ud))
+        elif data == "scraper_girl_kw":
+            s = ud.data["scraper"]
+            await query.edit_message_text(
+                "🏷️  <b>GIRLS KEYWORDS</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Current: <code>%s</code>\n\n"
+                "Comma/space se keywords bhejo. Match name + username me hoga.\n"
+                "Example: <code>priya, sharma, kaur, neha, s</code>\n\n"
+                "Blank bhejne par auto-detect (Indian feminine endings) use hoga.\n"
+                "<code>clear</code> = auto-detect."
+                % html.escape((s.get("girl_keywords") or "auto-detect")[:200]),
+                parse_mode=ParseMode.HTML)
+            log_activity(user_id, "Setting girls keywords")
+            return SCRAP_GIRL_KW
         elif data == "scraper_mode_toggle":
             s = ud.data["scraper"]
             s["mode"] = "add" if s.get("mode", "send") == "send" else "send"
@@ -4429,14 +4761,20 @@ async def button_handler(update, context):
                         reply_markup=scraper_menu(ud))
                 else:
                     s["add_running"] = True
+                    s["add_added"] = 0
+                    s["add_failed"] = 0
+                    s["add_skipped"] = 0
+                    s["per_acc"] = {}
                     ud.save()
                     active_tasks.setdefault(user_id, {})
                     active_tasks[user_id]["scrap_add"] = asyncio.create_task(
                         scrap_add_task(user_id, accs, context.bot))
                     await query.edit_message_text(
-                        "🚀 <b>ADD STARTED</b>\n━━━━━━━━━━━━━━━━━━\n"
+                        "🚀 <b>ADD STARTED — ROUND ROBIN</b>\n━━━━━━━━━━━━━━━━━━\n"
                         f"👥 queued: {len(s.get('pending', []))}\n"
-                        f"⏱️ gap: {s.get('add_gap', 20)}s\n\nLive log aa raha hai.",
+                        f"👤 accounts: {len(accs)}\n"
+                        f"⏱️ gap: {s.get('add_gap', 20)}s (sirf success ke baad)\n\n"
+                        "Har user alag account se add hoga. Live log aa raha hai.",
                         parse_mode=ParseMode.HTML, reply_markup=scraper_menu(ud))
             else:
                 await query.answer("No pending members — pehle scrape karo.", show_alert=True)
@@ -4468,10 +4806,14 @@ async def button_handler(update, context):
                 f"📅  Daily Lmt:  {s['daily_limit'] or '♾️'}\n"
                 f"📅  Today:      {s['scraped_today']}\n"
                 f"⏱️  Batch Gap:  {s['gap']}s\n"
+                f"🔎  Scrape Cat: { {'all':'All members','girls':'Only girls','active':'Active members'}.get(s.get('member_mode','all'),'All') }\n"
+                f"🏷️  Keywords:   {(s.get('girl_keywords') or 'auto-detect')[:30]}\n"
+                f"🛰️  Source:     {s.get('source_used') or '—'}   raw: {s.get('found_total', 0)}\n"
                 f"🔀  Mode:       {'ADD to group' if s.get('mode','send')=='add' else 'SEND as message'}\n"
                 f"📦  Pending:    {len(s.get('pending', []))}\n"
-                f"➕  Add Gap:    {s.get('add_gap', 20)}s\n"
-                f"✅  Add ok:     {s.get('add_added', 0)}   ❌ fail: {s.get('add_failed', 0)}\n"
+                f"➕  Add Gap:    {s.get('add_gap', 20)}s (success only)\n"
+                f"✅  Add ok:     {s.get('add_added', 0)}   ❌ fail: {s.get('add_failed', 0)}   ⏭️ skip: {s.get('add_skipped', 0)}\n"
+                f"♻️  Per acct:   {', '.join('…%s=%d' % (k,v) for k,v in (s.get('per_acc') or {}).items()) or '—'}\n"
                 f"🔄  Status:     {'🟢  RUNNING' if s['running'] else '🔴  STOPPED'}"
             )
             await query.edit_message_text(txt, parse_mode=ParseMode.HTML,
@@ -5095,6 +5437,19 @@ async def message_handler(update, context):
             await update.message.reply_text("❌  Invalid. Use seconds (<code>30</code>) or minutes (<code>2m</code>). Try again:", parse_mode=ParseMode.HTML)
             return SCRAP_USER_GAP
 
+    elif state == SCRAP_GIRL_KW:
+        txt = msg.strip()
+        if txt.lower() in ("clear", "none", "off", "-"):
+            txt = ""
+        ud.data["scraper"]["girl_keywords"] = txt[:300]
+        ud.save()
+        context.user_data['_state'] = None
+        await update.message.reply_text(
+            "✅  Girls keywords set: <code>%s</code>"
+            % html.escape(txt[:200] if txt else "auto-detect"),
+            parse_mode=ParseMode.HTML, reply_markup=scraper_menu(ud))
+        log_activity(user.id, f"Girls keywords: {txt[:60]}")
+
     elif state == SCRAP_DAILY_LIMIT:
         try:
             limit = int(msg)
@@ -5492,6 +5847,57 @@ async def message_handler(update, context):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
+async def backup_cmd(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in DATA_DIR.glob("%s_*" % uid):
+                if f.is_file():
+                    z.write(f, arcname=f.name)
+        buf.seek(0)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        await update.message.reply_document(document=buf,
+            filename="ads_backup_%s_%s.zip" % (uid, stamp),
+            caption="🗄️ Backup — Render restart ke baad /restore se wapas import karo.")
+        log_activity(uid, "Created backup")
+    except Exception as e:
+        await update.message.reply_text("❌ Backup failed: %s" % html.escape(str(e)[:120]))
+
+async def restore_cmd(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    msg = update.message
+    doc = msg.document if msg else None
+    if not doc:
+        await msg.reply_text("📦 Backup zip file ko reply karke /restore bhejo.")
+        return
+    try:
+        tg = await doc.get_file()
+        raw = bytes(await tg.download_as_bytearray())
+        n = 0
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            for name in z.namelist():
+                if "/" in name or "\\" in name or not name.startswith("%s_" % uid):
+                    continue
+                if not name.endswith((".json", ".log")):
+                    continue
+                with z.open(name) as src, open(DATA_DIR / name, "wb") as dst:
+                    dst.write(src.read())
+                n += 1
+        USER_DATA_CACHE.pop(uid, None)
+        ud = get_user_data(uid)
+        await msg.reply_text(
+            "✅ Restore ho gaya — %d files.\n👤 accounts: %d  •  📋 rejoin groups: %d\n\nAb /start karo."
+            % (n, len(ud.data.get("acc", {})), len(ud.data.get("rej", {}).get("approved", []))),
+            parse_mode=ParseMode.HTML)
+        log_activity(uid, "Restored backup")
+    except Exception as e:
+        await msg.reply_text("❌ Restore failed: %s" % html.escape(str(e)[:120]))
+
 async def start(update, context):
     if not update.message:
         return
@@ -5803,6 +6209,8 @@ def main():
     app.add_handler(CommandHandler("adduser", adduser_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("users", listusers_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
     
     async def _bh(update, context):
         r = await button_handler(update, context)
