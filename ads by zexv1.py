@@ -125,6 +125,22 @@ load_api_config()
 active_tasks: Dict[int, Dict[str, asyncio.Task]] = {}
 BOT_START_TIME = datetime.now()
 
+def task_alive(user_id, key):
+    t = active_tasks.get(user_id, {}).get(key)
+    return t is not None and not t.done()
+
+def any_task_alive(user_id, prefix):
+    for k in list(active_tasks.get(user_id, {})):
+        if k.startswith(prefix) and task_alive(user_id, k):
+            return True
+    return False
+
+def rejoin_live(user_id, ud):
+    r = ud.data.get("rej", {})
+    if not r.get("running"):
+        return False
+    return task_alive(user_id, "rej") or any_task_alive(user_id, "rej_")
+
 ABUSIVE_WORDS = {
     # ── Hindi (Devanagari) ──
     "मादरचोद","बहनचोद","लौडा","लोडा","भोसडी","भोसड़ी","चूत","लंड","लण्ड",
@@ -1132,7 +1148,8 @@ class UserData:
             "rej": {"approved":[],"denied":[],"blacklist":[],"gap":30,"cycles":0,
                 "safe_mode":False,"running":False,"joined_count":0,"left_count":0,
                 "include_discussions":True,"disc_gap":2,"auto_rejoin_on_kick":True,
-                "use_all_acc":False,"priority":False,"member_counts":{},"auto_approve":False},
+                "use_all_acc":False,"priority":False,"member_counts":{},"auto_approve":False,
+                "last_error":"","last_heartbeat":"","session_started":"","last_stop_at":""},
             "scraper": {"target":"","delivery":"","gap":3,"running":False,"scraped":0,
                         "user_gap":60,"daily_limit":0,"scraped_today":0,"last_scrape_date":"",
                         "mode":"send","add_gap":20,"add_running":False,"pending":[],
@@ -1185,19 +1202,22 @@ def get_user_data(user_id) -> UserData:
         ud = UserData(user_id)
         if user_id not in active_tasks:
             active_tasks[user_id] = {}
-        # Reset running rejoin on startup
-        if ud.data.get("rej",{}).get("running"):
-            ud.data["rej"]["running"] = False
-        ud.save()
         USER_DATA_CACHE[user_id] = ud
     return USER_DATA_CACHE[user_id]
+
+CLIENT_ERRORS: Dict[str, str] = {}
 
 async def get_client(phone, user_data) -> Optional[TelegramClient]:
     accs = user_data.data.get("acc", {})
     if phone not in accs:
+        CLIENT_ERRORS[phone] = "account not found in list"
         logger.warning(f"Phone {phone} not in accounts")
         return None
     session_str = accs[phone].get("ss","")
+    if not session_str:
+        CLIENT_ERRORS[phone] = "no session saved — re-login account"
+        logger.error(f"Account {phone} has no session")
+        return None
     px = user_data.data.get("proxy", {})
     proxy = None
     if px.get("enabled") and px.get("host"):
@@ -1206,24 +1226,38 @@ async def get_client(phone, user_data) -> Optional[TelegramClient]:
                  "http": connection.Connection.HttpType}.get(
             px.get("type","socks5"), connection.Connection.Socks5Type)
         proxy = (ptype, px["host"], int(px.get("port", 0)), px.get("username",""), px.get("password",""))
-    client = None
-    try:
-        client = TelegramClient(StringSession(session_str), API_ID, API_HASH, proxy=proxy,
-            connection_retries=1, request_retries=2, timeout=30)
-        await asyncio.wait_for(client.connect(), timeout=60)
-        if not await asyncio.wait_for(client.is_user_authorized(), timeout=10):
-            logger.error(f"Account {phone} is not authorized")
-            user_data.data["acc"][phone]["active"] = False
-            user_data.save()
-            await client.disconnect()
-            return None
-        return client
-    except Exception as e:
-        logger.error(f"Failed to get client for {phone}: {e}")
-        if client:
-            try: await client.disconnect()
-            except: pass
-        return None
+    last_err = "unknown"
+    for attempt in range(2):
+        client = None
+        try:
+            client = TelegramClient(StringSession(session_str), API_ID, API_HASH, proxy=proxy,
+                connection_retries=1, request_retries=2, timeout=30)
+            await asyncio.wait_for(client.connect(), timeout=60)
+            if not await asyncio.wait_for(client.is_user_authorized(), timeout=10):
+                last_err = "session expired / logged out — re-login account"
+                logger.error(f"Account {phone} is not authorized")
+                user_data.data["acc"][phone]["active"] = False
+                user_data.save()
+                await client.disconnect()
+                CLIENT_ERRORS[phone] = last_err
+                return None
+            CLIENT_ERRORS.pop(phone, None)
+            return client
+        except asyncio.CancelledError:
+            if client:
+                try: await client.disconnect()
+                except: pass
+            raise
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            logger.error(f"Failed to get client for {phone} (try {attempt+1}/2): {last_err}")
+            if client:
+                try: await client.disconnect()
+                except: pass
+            if attempt == 0:
+                await asyncio.sleep(2)
+    CLIENT_ERRORS[phone] = last_err
+    return None
 
 async def resolve_entity(client, link):
     """Resolve a public/invite link to an entity without failing on already-joined."""
@@ -1294,14 +1328,41 @@ GIRL_NAME_SUFFIXES = {
 
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤  Accounts", callback_data="menu_accounts"),
-         InlineKeyboardButton("🔄  Rejoin", callback_data="menu_rejoin")],
         [InlineKeyboardButton("📊  Dashboard", callback_data="menu_dashboard"),
+         InlineKeyboardButton("👤  Accounts", callback_data="menu_accounts")],
+        [InlineKeyboardButton("🔄  Rejoin", callback_data="menu_rejoin"),
          InlineKeyboardButton("🚨  Banning", callback_data="menu_banning")],
-        [InlineKeyboardButton("⚙️  Settings", callback_data="menu_settings")],
         [InlineKeyboardButton("🧩  Features", callback_data="menu_features"),
+         InlineKeyboardButton("📈  Live Logs", callback_data="menu_logs")],
+        [InlineKeyboardButton("⚙️  Settings", callback_data="menu_settings"),
          InlineKeyboardButton("❓  Help", callback_data="menu_help")],
     ])
+
+def menu_logs_text(ud, user_id):
+    lines = []
+    try:
+        log_file = DATA_DIR / ("%s_activity.log" % user_id)
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.readlines()[-12:]
+            lines = [ln.strip() for ln in raw if ln.strip()]
+    except Exception:
+        lines = []
+    r = ud.data.get("rej", {})
+    live = rejoin_live(user_id, ud)
+    diag = []
+    diag.append("Rejoin: %s" % ("LIVE" if live else ("INTERRUPTED" if r.get("running") else "stopped")))
+    if r.get("last_heartbeat"):
+        diag.append("Heartbeat: %s" % r["last_heartbeat"])
+    if r.get("last_error"):
+        diag.append("Last error: %s" % str(r["last_error"])[:140])
+    for ph, reason in list(CLIENT_ERRORS.items())[:3]:
+        diag.append("acct …%s: %s" % (ph[-4:], str(reason)[:90]))
+    body = "\n".join("<code>%s</code>" % html.escape(x) for x in lines) if lines else "<i>No activity yet.</i>"
+    return ("📈  <b>LIVE LOGS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "<b>Recent activity</b>\n%s\n\n"
+            "<b>Diagnostics</b>\n%s" % (body, "\n".join(html.escape(x) for x in diag)))
 
 def features_menu():
     return InlineKeyboardMarkup([
@@ -1326,7 +1387,8 @@ def accounts_menu(ud):
 
 def rejoin_menu(ud):
     r = ud.data.get("rej", {})
-    sts = "⏹️  STOP" if r.get("running") else "▶️  START"
+    live = rejoin_live(ud.user_id, ud)
+    sts = "⏹️  STOP" if live else "▶️  START"
     safe = "🛡️  Safe: 5-10s" if r.get("safe_mode") else "🛡️  Safe: OFF"
     disc = "💬  Discussions: ON" if r.get("include_discussions", True) else "💬  Discussions: OFF"
     use_all = "👥  Multi-Acc: ON" if r.get("use_all_acc") else "👥  Multi-Acc: OFF"
@@ -1554,31 +1616,52 @@ async def show_dashboard(update, context):
     try:
         acc_count = len(accs)
         active_count = len([p for p in accs if accs[p].get("active", True)])
-
+        r_live = rejoin_live(user_id, ud)
+        s_live = task_alive(user_id, "scraper")
+        add_pending = len(s.get("pending", []))
+        acc_lines = []
+        for ph in list(accs)[:4]:
+            flag = "🟢" if accs[ph].get("active", True) else "🔴"
+            acc_lines.append("     %s  …%s" % (flag, ph[-4:]))
+        if acc_count > 4:
+            acc_lines.append("     … +%d more" % (acc_count - 4))
+        if not acc_lines:
+            acc_lines.append("     <i>No accounts added</i>")
+        rejoin_line = "🟢  RUNNING" if r_live else ("🟡  INTERRUPTED" if r.get("running") else "🔴  STOPPED")
         txt = (
-            "📊  <b>DASHBOARD</b>\n"
+            "📊  <b>CONTROL CENTER</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "👤  <b>Accounts</b>\n"
-            f"     🟢  Active: {active_count}\n"
-            f"     📦  Total:  {acc_count}\n\n"
-            "🔄  <b>Rejoin</b>\n"
-            f"     {'🟢  RUNNING' if r.get('running') else '🔴  STOPPED'}\n"
-            f"     ✅  Joined: {r.get('joined_count', 0)}   ❌  Left: {r.get('left_count', 0)}\n"
-            f"     📋  Groups: {len(r.get('approved', []))}   🚫  Blocked: {len(r.get('blacklist', []))}\n\n"
-            "👥  <b>Scraper</b>\n"
-            f"     {'🟢  RUNNING' if s.get('running') else '🔴  STOPPED'}\n"
-            f"     👤  Scraped: {s.get('scraped', 0)}\n\n"
-            "🚨  <b>Banning</b>\n"
-            f"     {'🟢  RUNNING' if b.get('running') else '🔴  STOPPED'}\n"
-            f"     📋  Reports: {len(b.get('reports', []))}\n\n"
+            "👤  <b>ACCOUNTS</b>  —  %d active / %d total\n%s\n\n"
+            "🔄  <b>REJOIN</b>  —  %s\n"
+            "     ✅ %d joined   ↩️ %d left   ⚠️ %d failed\n"
+            "     📋 %d groups   🚫 %d blocked   🔄 %s cycles\n"
+            "     💓 %s%s\n\n"
+            "👥  <b>SCRAPER</b>  —  %s\n"
+            "     👤 %d scraped   📥 %d pending add\n\n"
+            "🚨  <b>BANNING</b>  —  %s\n"
+            "     📋 %d reports\n\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"⏱️  Uptime: {get_uptime()}"
+            "⏱️  Uptime: %s"
+            % (active_count, acc_count, "\n".join(acc_lines),
+               rejoin_line,
+               r.get("joined_count", 0), r.get("left_count", 0), r.get("failed_count", 0),
+               len(r.get("approved", [])), len(r.get("blacklist", [])),
+               ("∞" if r.get("cycles", 0) == 0 else r.get("cycles", 0)),
+               (r.get("last_heartbeat") or "—"),
+               ("   ⚠️ <code>%s</code>" % html.escape(str(r.get("last_error"))[:100]) if r.get("last_error") else ""),
+               ("🟢 RUNNING" if s_live else "🔴 STOPPED"),
+               s.get("scraped", 0), add_pending,
+               ("🟢 RUNNING" if b.get("running") else "🔴 STOPPED"),
+               len(b.get("reports", [])),
+               get_uptime())
         )
-
         await query.edit_message_text(txt, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄  Refresh", callback_data="menu_dashboard"),
-                 InlineKeyboardButton("🔙  Back", callback_data="back_main")],
+                 InlineKeyboardButton("📈  Logs", callback_data="menu_logs")],
+                [InlineKeyboardButton("🔄  Rejoin", callback_data="menu_rejoin"),
+                 InlineKeyboardButton("👥  Scraper", callback_data="menu_scraper")],
+                [InlineKeyboardButton("🔙  Back", callback_data="back_main")],
             ]))
         log_activity(user_id, "Viewed dashboard")
     except Exception as e:
@@ -1650,233 +1733,281 @@ async def delayed_heart_reaction(phone, user_id, link):
 
 async def rejoin_cycle_task(user_id, phone, bot, groups_override=None, slot=0, total=1):
     ud = get_user_data(user_id); rej = ud.data["rej"]
+    acc = phone[-4:] if len(phone) >= 4 else phone
     client = await get_client(phone, ud)
     if not client:
-        rej["running"] = False; ud.save(); return
-    acc = phone[-4:] if len(phone) >= 4 else phone
+        reason = CLIENT_ERRORS.get(phone, "connection failed")
+        rej["running"] = False
+        rej["last_error"] = "Connect failed: " + reason
+        rej["last_stop_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ud.save()
+        await notify_progress(bot, user_id,
+            "❌ <b>REJOIN STOPPED — ACCOUNT CONNECT FAILED</b>\n"
+            "👤 account: <code>…%s</code>\n"
+            "⚠️ reason: <code>%s</code>\n\n"
+            "<b>Fix karo:</b>\n"
+            "• Accounts → account delete karke dobara login karo\n"
+            "• Proxy ON hai to band karke try karo\n"
+            "• Dusre device/bot pe same account chal raha ho to band karo"
+            % (acc, html.escape(reason[:160])))
+        if user_id in active_tasks:
+            active_tasks[user_id].pop("rej_%s" % phone, None)
+            active_tasks[user_id].pop("rej", None)
+            remaining = [k for k in active_tasks.get(user_id, {}) if k.startswith("rej_")]
+            if not remaining:
+                if user_id in active_tasks:
+                    active_tasks[user_id].pop("rej", None)
+        return
+    rej["last_error"] = ""
+    rej["session_started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rej["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
+    ud.save()
     ecache = {}
+    cancelled = False
     try:
         cycle = 0
+        backoff = 5
         while rej["running"]:
-            base = list(rej["approved"])
-            if not base and groups_override:
-                base = list(groups_override)
-            if not base:
-                rej["running"] = False; ud.save(); break
-            if rej["cycles"] > 0 and cycle >= rej["cycles"]:
-                break
-
-            groups = list(base)
-            random.shuffle(groups)
-
-            if rej.get("priority"):
-                mc = rej.get("member_counts", {})
-                missing = [g for g in groups if g not in mc]
-                if missing and cycle == 0:
-                    for g in missing:
-                        try:
-                            e = await client.get_entity(g)
-                            mc[g] = getattr(e, "participants_count", 0) or 0
-                        except Exception:
-                            mc[g] = 0
-                    rej["member_counts"] = mc
-                    ud.save()
-                groups.sort(key=lambda x: mc.get(x, 0), reverse=True)
-
-            if groups:
-                off = (slot + cycle * max(total, 1)) % len(groups)
-                groups = groups[off:] + groups[:off]
-
-            total_groups = len(groups)
-            c_join = c_left = c_fail = 0
-            drop = []
-
-            for idx, link in enumerate(groups, 1):
-                if not rej["running"]:
+            try:
+                base = list(rej["approved"])
+                if not base and groups_override:
+                    base = list(groups_override)
+                if not base:
+                    rej["running"] = False; ud.save(); break
+                if rej["cycles"] > 0 and cycle >= rej["cycles"]:
                     break
-
-                gap = int(rej["gap"] or 30)
-                if rej["safe_mode"]:
-                    gap = random.randint(5, 10)
-                stay = gap
-                chat = ecache.get(link)
-                disc = None
-                already = False
-                joined = False
-                title = link
-                fail_reason = ""
-
-                for attempt in range(3):
-                    try:
-                        if "t.me/+" in link or "joinchat" in link:
-                            h = link.split("/")[-1].replace("+", "")
+    
+                groups = list(base)
+                random.shuffle(groups)
+    
+                if rej.get("priority"):
+                    mc = rej.get("member_counts", {})
+                    missing = [g for g in groups if g not in mc]
+                    if missing and cycle == 0:
+                        for g in missing:
                             try:
-                                up = await client(ImportChatInviteRequest(h))
-                                if getattr(up, "chats", None):
-                                    chat = up.chats[0]; ecache[link] = chat
-                            except UserAlreadyParticipantError:
-                                already = True
-                                if chat is None:
-                                    try:
-                                        inv = await client(CheckChatInviteRequest(h))
-                                        if isinstance(inv, ChatInviteAlready):
-                                            chat = inv.chat; ecache[link] = chat
-                                    except Exception:
-                                        pass
-                                if chat is None:
-                                    try:
-                                        chat = await client.get_entity(link); ecache[link] = chat
-                                    except Exception:
-                                        pass
-                        else:
-                            if chat is None:
-                                chat = await client.get_entity(link); ecache[link] = chat
-                            try:
-                                await client(JoinChannelRequest(chat))
-                            except UserAlreadyParticipantError:
-                                already = True
-                        if chat is None:
-                            fail_reason = "Cannot resolve group"
-                            break
-                        title = getattr(chat, "title", None) or link
-                        joined = True
-                        break
-                    except FloodWaitError as e:
-                        wait = int(e.seconds) + random.randint(1, 3)
-                        await notify_progress(bot, user_id,
-                            "⏳ <b>FLOOD</b>  •  acct …%s  •  %s\n"
-                            "waiting <b>%ds</b> then retry %d/3"
-                            % (acc, html.escape(str(title)[:40]), wait, attempt + 1))
-                        await asyncio.sleep(wait)
-                    except (InviteHashExpiredError, InviteHashInvalidError, ValueError,
-                            ChannelPrivateError, ChannelInvalidError) as e:
-                        fail_reason = "Dead / private / invalid link"
-                        drop.append(link)
-                        break
-                    except Exception as e:
-                        fail_reason = "%s: %s" % (type(e).__name__, str(e)[:60])
-                        break
-
-                if any(d == link for d in drop) and not joined:
-                    c_fail += 1
-                    await notify_progress(bot, user_id,
-                        "🚫 <b>BLACKLISTED</b>  •  acct …%s\n"
-                        "<code>%s</code>\nreason: %s"
-                        % (acc, html.escape(link[:60]), html.escape(fail_reason or "invalid")))
-                    continue
-
-                if not joined:
-                    c_fail += 1
-                    await notify_progress(bot, user_id,
-                        "❌ <b>JOIN FAILED</b>  •  acct …%s  %d/%d\n"
-                        "group: <b>%s</b>\nreason: %s"
-                        % (acc, idx, total_groups, html.escape(str(title)[:40]),
-                           html.escape(fail_reason or "unknown")))
-                    continue
-
-                if not already:
-                    rej["joined_count"] += 1; ud.save(); c_join += 1
-
-                if rej.get("include_discussions", True):
-                    try:
-                        full = await client(GetFullChannelRequest(chat.id))
-                        disc_id = getattr(full.full_chat, "linked_chat_id", None)
-                        if disc_id:
-                            try:
-                                disc = await client.get_entity(disc_id)
+                                e = await client.get_entity(g)
+                                mc[g] = getattr(e, "participants_count", 0) or 0
                             except Exception:
-                                disc = await client.get_entity(InputPeerChannel(disc_id, 0))
-                            if disc:
+                                mc[g] = 0
+                        rej["member_counts"] = mc
+                        ud.save()
+                    groups.sort(key=lambda x: mc.get(x, 0), reverse=True)
+    
+                if groups:
+                    off = (slot + cycle * max(total, 1)) % len(groups)
+                    groups = groups[off:] + groups[:off]
+    
+                total_groups = len(groups)
+                c_join = c_left = c_fail = 0
+                drop = []
+    
+                for idx, link in enumerate(groups, 1):
+                    if not rej["running"]:
+                        break
+                    rej["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
+
+                    gap = int(rej["gap"] or 30)
+                    if rej["safe_mode"]:
+                        gap = random.randint(5, 10)
+                    stay = gap
+                    chat = ecache.get(link)
+                    disc = None
+                    already = False
+                    joined = False
+                    title = link
+                    fail_reason = ""
+    
+                    for attempt in range(3):
+                        try:
+                            if "t.me/+" in link or "joinchat" in link:
+                                h = link.split("/")[-1].replace("+", "")
                                 try:
-                                    await client(JoinChannelRequest(disc))
-                                    rej["joined_count"] += 1; ud.save(); c_join += 1
+                                    up = await client(ImportChatInviteRequest(h))
+                                    if getattr(up, "chats", None):
+                                        chat = up.chats[0]; ecache[link] = chat
                                 except UserAlreadyParticipantError:
-                                    pass
-                                await notify_progress(bot, user_id,
-                                    "💬 <b>DISCUSSION JOINED</b>  •  acct …%s\n%s"
-                                    % (acc, html.escape(str(getattr(disc, "title", "?") or "?"))))
-                                await asyncio.sleep(min(rej.get("disc_gap", 2), 5))
+                                    already = True
+                                    if chat is None:
+                                        try:
+                                            inv = await client(CheckChatInviteRequest(h))
+                                            if isinstance(inv, ChatInviteAlready):
+                                                chat = inv.chat; ecache[link] = chat
+                                        except Exception:
+                                            pass
+                                    if chat is None:
+                                        try:
+                                            chat = await client.get_entity(link); ecache[link] = chat
+                                        except Exception:
+                                            pass
+                            else:
+                                if chat is None:
+                                    chat = await client.get_entity(link); ecache[link] = chat
+                                try:
+                                    await client(JoinChannelRequest(chat))
+                                except UserAlreadyParticipantError:
+                                    already = True
+                            if chat is None:
+                                fail_reason = "Cannot resolve group"
+                                break
+                            title = getattr(chat, "title", None) or link
+                            joined = True
+                            break
+                        except FloodWaitError as e:
+                            wait = int(e.seconds) + random.randint(1, 3)
+                            await notify_progress(bot, user_id,
+                                "⏳ <b>FLOOD</b>  •  acct …%s  •  %s\n"
+                                "waiting <b>%ds</b> then retry %d/3"
+                                % (acc, html.escape(str(title)[:40]), wait, attempt + 1))
+                            await asyncio.sleep(wait)
+                        except (InviteHashExpiredError, InviteHashInvalidError, ValueError,
+                                ChannelPrivateError, ChannelInvalidError) as e:
+                            fail_reason = "Dead / private / invalid link"
+                            drop.append(link)
+                            break
+                        except Exception as e:
+                            fail_reason = "%s: %s" % (type(e).__name__, str(e)[:60])
+                            break
+    
+                    if any(d == link for d in drop) and not joined:
+                        c_fail += 1
+                        await notify_progress(bot, user_id,
+                            "🚫 <b>BLACKLISTED</b>  •  acct …%s\n"
+                            "<code>%s</code>\nreason: %s"
+                            % (acc, html.escape(link[:60]), html.escape(fail_reason or "invalid")))
+                        continue
+    
+                    if not joined:
+                        c_fail += 1
+                        await notify_progress(bot, user_id,
+                            "❌ <b>JOIN FAILED</b>  •  acct …%s  %d/%d\n"
+                            "group: <b>%s</b>\nreason: %s"
+                            % (acc, idx, total_groups, html.escape(str(title)[:40]),
+                               html.escape(fail_reason or "unknown")))
+                        continue
+    
+                    if not already:
+                        rej["joined_count"] += 1; ud.save(); c_join += 1
+    
+                    if rej.get("include_discussions", True):
+                        try:
+                            full = await client(GetFullChannelRequest(chat.id))
+                            disc_id = getattr(full.full_chat, "linked_chat_id", None)
+                            if disc_id:
+                                try:
+                                    disc = await client.get_entity(disc_id)
+                                except Exception:
+                                    disc = await client.get_entity(InputPeerChannel(disc_id, 0))
+                                if disc:
+                                    try:
+                                        await client(JoinChannelRequest(disc))
+                                        rej["joined_count"] += 1; ud.save(); c_join += 1
+                                    except UserAlreadyParticipantError:
+                                        pass
+                                    await notify_progress(bot, user_id,
+                                        "💬 <b>DISCUSSION JOINED</b>  •  acct …%s\n%s"
+                                        % (acc, html.escape(str(getattr(disc, "title", "?") or "?"))))
+                                    await asyncio.sleep(min(rej.get("disc_gap", 2), 5))
+                        except Exception:
+                            pass
+    
+                    if (rej.get("include_discussions", True) and not disc
+                            and getattr(chat, "broadcast", False)):
+                        drop.append(link)
+                        await notify_progress(bot, user_id,
+                            "🚫 <b>NO DISCUSSION</b>  •  acct …%s\n%s — blacklisted"
+                            % (acc, html.escape(str(title)[:40])))
+                        try:
+                            await client(LeaveChannelRequest(chat))
+                        except Exception:
+                            pass
+                        c_fail += 1
+                        continue
+    
+                    await notify_progress(bot, user_id,
+                        "✅ <b>JOINED</b>  •  acct …%s  %d/%d\n"
+                        "group: <b>%s</b>\nmembers: %s  •  cycle %d%s"
+                        % (acc, idx, total_groups, html.escape(str(title)[:40]),
+                           getattr(chat, "participants_count", 0) or "?",
+                           cycle + 1, "  •  rejoin" if already else ""))
+    
+                    try:
+                        mc = getattr(chat, "participants_count", 999) or 999
+                        if mc < 100:
+                            stay = max(10, int(gap * 0.3))
                     except Exception:
                         pass
-
-                if (rej.get("include_discussions", True) and not disc
-                        and getattr(chat, "broadcast", False)):
-                    drop.append(link)
-                    await notify_progress(bot, user_id,
-                        "🚫 <b>NO DISCUSSION</b>  •  acct …%s\n%s — blacklisted"
-                        % (acc, html.escape(str(title)[:40])))
+    
+                    if not rej["running"]:
+                        break
+                    if rej["safe_mode"]:
+                        await human_wait()
+                    else:
+                        await asyncio.sleep(stay)
+    
                     try:
                         await client(LeaveChannelRequest(chat))
+                        rej["left_count"] += 1; ud.save(); c_left += 1
                     except Exception:
                         pass
-                    c_fail += 1
-                    continue
-
+                    if disc:
+                        try:
+                            await client(LeaveChannelRequest(disc))
+                            rej["left_count"] += 1; ud.save()
+                        except Exception:
+                            pass
+                    await notify_progress(bot, user_id,
+                        "↩️ <b>LEFT</b>  •  acct …%s\n%s"
+                        % (acc, html.escape(str(title)[:40])))
+                    await asyncio.sleep(random.uniform(0.5, 2.0))
+    
+                for link in drop:
+                    if link in rej["approved"]:
+                        rej["approved"].remove(link)
+                    if link not in rej["blacklist"]:
+                        rej["blacklist"].append(link)
+                    if groups_override is not None and link in groups_override:
+                        groups_override.remove(link)
+                rej["failed_count"] = rej.get("failed_count", 0) + c_fail
+                rej["last_cycle_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rej["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
+                rej["last_error"] = ""
+                ud.save()
+    
                 await notify_progress(bot, user_id,
-                    "✅ <b>JOINED</b>  •  acct …%s  %d/%d\n"
-                    "group: <b>%s</b>\nmembers: %s  •  cycle %d%s"
-                    % (acc, idx, total_groups, html.escape(str(title)[:40]),
-                       getattr(chat, "participants_count", 0) or "?",
-                       cycle + 1, "  •  rejoin" if already else ""))
-
-                try:
-                    mc = getattr(chat, "participants_count", 999) or 999
-                    if mc < 100:
-                        stay = max(10, int(gap * 0.3))
-                except Exception:
-                    pass
-
-                if not rej["running"]:
-                    break
-                if rej["safe_mode"]:
-                    await human_wait()
-                else:
-                    await asyncio.sleep(stay)
-
-                try:
-                    await client(LeaveChannelRequest(chat))
-                    rej["left_count"] += 1; ud.save(); c_left += 1
-                except Exception:
-                    pass
-                if disc:
-                    try:
-                        await client(LeaveChannelRequest(disc))
-                        rej["left_count"] += 1; ud.save()
-                    except Exception:
-                        pass
+                    "🔁 <b>CYCLE %d DONE</b>  •  acct …%s\n"
+                    "joined %d  •  left %d  •  failed %d  •  groups %d\n"
+                    "running totals — joined %d / left %d / failed %d"
+                    % (cycle + 1, acc, c_join, c_left, c_fail, total_groups,
+                       rej["joined_count"], rej["left_count"],
+                       rej.get("failed_count", 0)))
+                cycle += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                reason = "%s: %s" % (type(e).__name__, str(e)[:140])
+                rej["last_error"] = reason
+                rej["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
+                ud.save()
                 await notify_progress(bot, user_id,
-                    "↩️ <b>LEFT</b>  •  acct …%s\n%s"
-                    % (acc, html.escape(str(title)[:40])))
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-
-            for link in drop:
-                if link in rej["approved"]:
-                    rej["approved"].remove(link)
-                if link not in rej["blacklist"]:
-                    rej["blacklist"].append(link)
-                if groups_override is not None and link in groups_override:
-                    groups_override.remove(link)
-            rej["failed_count"] = rej.get("failed_count", 0) + c_fail
-            rej["last_cycle_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ud.save()
-
-            await notify_progress(bot, user_id,
-                "🔁 <b>CYCLE %d DONE</b>  •  acct …%s\n"
-                "joined %d  •  left %d  •  failed %d  •  groups %d\n"
-                "running totals — joined %d / left %d / failed %d"
-                % (cycle + 1, acc, c_join, c_left, c_fail, total_groups,
-                   rej["joined_count"], rej["left_count"],
-                   rej.get("failed_count", 0)))
-            cycle += 1
+                    "⚠️ <b>REJOIN UNSTABLE</b>  •  acct …%s\n"
+                    "reason: <code>%s</code>\nretrying in %ds..."
+                    % (acc, html.escape(reason[:140]), backoff))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            backoff = 5
     except asyncio.CancelledError:
-        pass
+        cancelled = True
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
+        rej["last_stop_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if groups_override is None:
-            rej["running"] = False
+            if not cancelled:
+                rej["running"] = False
             ud.save()
             if user_id in active_tasks:
                 active_tasks[user_id].pop('rej', None)
@@ -1886,7 +2017,7 @@ async def rejoin_cycle_task(user_id, phone, bot, groups_override=None, slot=0, t
             if user_id in active_tasks:
                 active_tasks[user_id].pop(task_key, None)
             remaining = [k for k in active_tasks.get(user_id, {}) if k.startswith("rej_")]
-            if not remaining:
+            if not remaining and not cancelled:
                 rej["running"] = False
                 ud.save()
 
@@ -1897,7 +2028,19 @@ async def rejoin_cycle_task(user_id, phone, bot, groups_override=None, slot=0, t
 async def scraper_task(user_id, phone, bot):
     ud = get_user_data(user_id); s = ud.data["scraper"]
     client = await get_client(phone, ud)
-    if not client: s["running"] = False; ud.save(); return
+    if not client:
+        reason = CLIENT_ERRORS.get(phone, "connection failed")
+        s["running"] = False
+        s["last_error"] = "Connect failed: " + reason
+        ud.save()
+        await notify_progress(bot, user_id,
+            "❌ <b>SCRAPER STOPPED — ACCOUNT CONNECT FAILED</b>\n"
+            "👤 account: <code>…%s</code>\n⚠️ reason: <code>%s</code>\n\n"
+            "Re-login the account or disable proxy and try again."
+            % (phone[-4:], html.escape(reason[:160])))
+        if user_id in active_tasks:
+            active_tasks[user_id].pop("scraper", None)
+        return
     acc = phone[-4:] if len(phone) >= 4 else phone
     try:
         target_entity = await resolve_entity(client, s["target"])
@@ -3393,6 +3536,15 @@ async def button_handler(update, context):
             log_activity(user_id, "Stopped all tasks after restart")
         elif data == "menu_dashboard":
             await show_dashboard(update, context)
+        elif data == "menu_logs":
+            ud2 = get_user_data(user_id)
+            await query.edit_message_text(menu_logs_text(ud2, user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄  Refresh", callback_data="menu_logs"),
+                     InlineKeyboardButton("📊  Dashboard", callback_data="menu_dashboard")],
+                    [InlineKeyboardButton("🔙  Back", callback_data="back_main")]]))
+            log_activity(user_id, "Viewed live logs")
         elif data == "menu_help":
             await show_help(update, context)
         elif data == "menu_settings":
@@ -3961,15 +4113,18 @@ async def button_handler(update, context):
             await query.edit_message_text(
                 "🔄  <b>REJOIN ENGINE</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                f"Status:  {'🟢  RUNNING' if r['running'] else '🔴  STOPPED'}\n"
+                f"Status:  {'🟢  RUNNING' if rejoin_live(user_id, ud) else ('🟡  INTERRUPTED' if r.get('running') else '🔴  STOPPED')}\n"
                 f"✅  Joined: {r['joined_count']}          ↩️  Left: {r['left_count']}\n"
                 f"⚠️  Failed: {r.get('failed_count', 0)}          🚫  Blocked: {len(r['blacklist'])}\n"
-                f"📋  Groups: {len(r['approved'])}          🔄  Cycles: {'∞' if r['cycles']==0 else r['cycles']}",
+                f"📋  Groups: {len(r['approved'])}          🔄  Cycles: {'∞' if r['cycles']==0 else r['cycles']}\n"
+                f"💓 Last activity: {r.get('last_heartbeat') or '—'}\n"
+                + (f"⚠️  Error: <code>{html.escape(str(r['last_error'])[:120])}</code>" if r.get('last_error') else ""),
                 parse_mode=ParseMode.HTML, reply_markup=rejoin_menu(ud))
             log_activity(user_id, "Opened rejoin menu")
         elif data == "rejoin_toggle":
             rej = ud.data["rej"]
-            if rej["running"]:
+            live = rejoin_live(user_id, ud)
+            if live:
                 rej["running"] = False
                 ud.save()
                 for key in list(active_tasks.get(user_id, {})):
@@ -3984,6 +4139,8 @@ async def button_handler(update, context):
                 await query.edit_message_text("⏹️  <b>REJOIN STOPPED</b>\n━━━━━━━━━━━━━━━━━━\nAll tasks cancelled.",
                     parse_mode=ParseMode.HTML, reply_markup=rejoin_menu(ud))
             else:
+                rej["running"] = False
+                rej["last_error"] = ""
                 accs = [p for p in ud.data["acc"] if ud.data["acc"][p].get("active", True)]
                 if not accs:
                     await query.edit_message_text("❌  <b>No Active Accounts</b>\n━━━━━━━━━━━━━━━━━━\nAdd & activate an account first.",
@@ -5354,7 +5511,7 @@ async def start(update, context):
         "🎛️  <b>Mega Marketing Bot</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"👤  Accounts: {acc_count}\n"
-        f"🔄  Rejoin:   {'🟢  Running' if ud.data['rej']['running'] else '🔴  Stopped'}",
+        f"🔄  Rejoin:   {'🟢  Running' if rejoin_live(user_id, ud) else '🔴  Stopped'}",
         parse_mode=ParseMode.HTML, reply_markup=main_menu())
     log_activity(user_id, "Bot started")
 
@@ -5458,7 +5615,7 @@ def auto_clear_cache():
 
 async def check_resume_tasks(app: Application):
     await asyncio.sleep(3)
-    data_dir = Path("user_data")
+    data_dir = DATA_DIR
     if not data_dir.exists():
         return
     for f in sorted(data_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
